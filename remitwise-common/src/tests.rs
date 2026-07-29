@@ -3007,3 +3007,31 @@ mod investigation_epoch_guard_comprehensive_tests {
         );
     }
 }
+
+mod verify_no_dust_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_zero_explicitly() {
+        // Before this fix, amount == 0 fell through to the generic dust
+        // check and returned an untyped `Err(())`, indistinguishable from
+        // any other rejection reason.
+        assert_eq!(verify_no_dust(0), Err(AmountError::ZeroAmount));
+    }
+
+    #[test]
+    fn rejects_negative_amount() {
+        assert_eq!(verify_no_dust(-1), Err(AmountError::NegativeAmount));
+    }
+
+    #[test]
+    fn rejects_dust_amount() {
+        assert_eq!(verify_no_dust(1), Err(AmountError::DustAmount));
+    }
+
+    #[test]
+    fn accepts_amount_above_dust_threshold() {
+        assert_eq!(verify_no_dust(2), Ok(()));
+        assert_eq!(verify_no_dust(1_000_000), Ok(()));
+    }
+}

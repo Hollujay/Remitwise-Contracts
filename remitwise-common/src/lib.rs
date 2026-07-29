@@ -759,14 +759,33 @@ pub fn get_rate_limit_status(env: &Env, caller: &Address, operation: Symbol) -> 
     (record.count, window_id + RATE_LIMIT_WINDOW_SECONDS)
 }
 
+/// Typed error returned by [`verify_no_dust`], distinguishing *why* an amount
+/// was rejected instead of collapsing every case into an opaque `()`.
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum AmountError {
+    /// `amount == 0`. Rejected explicitly rather than falling through to the
+    /// dust check, since a zero-value deposit is a distinct caller mistake
+    /// (e.g. an unset form field) from a merely-too-small one.
+    ZeroAmount = 1,
+    /// `amount < 0`.
+    NegativeAmount = 2,
+    /// `0 < amount <= 1` stroop: economically meaningless (1 stroop = 0.0000001 XLM).
+    DustAmount = 3,
+}
+
 /// Verifies that an amount is above the dust threshold (1 stroop).
 ///
-/// Returns `Ok(())` when `amount > 1`, otherwise returns an error.
-/// This is a defence-in-depth check to prevent amounts that are
-/// economically meaningless (1 stroop = 0.0000001 XLM).
-pub fn verify_no_dust(amount: i128) -> Result<(), ()> {
-    if amount <= 1 {
-        Err(())
+/// Returns `Ok(())` when `amount > 1`, otherwise returns the specific
+/// [`AmountError`] variant explaining why it was rejected.
+pub fn verify_no_dust(amount: i128) -> Result<(), AmountError> {
+    if amount == 0 {
+        Err(AmountError::ZeroAmount)
+    } else if amount < 0 {
+        Err(AmountError::NegativeAmount)
+    } else if amount <= 1 {
+        Err(AmountError::DustAmount)
     } else {
         Ok(())
     }
