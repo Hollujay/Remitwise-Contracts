@@ -2819,6 +2819,14 @@ impl SavingsGoalContract {
         if remitwise_common::require_no_active_kill_switch(&env).is_err() {
             return Vec::new(&env);
         }
+        // This entrypoint is permissionless (anyone may call it to advance due
+        // schedules), so it must independently respect the contract's own
+        // pause flag rather than relying only on the separate global kill
+        // switch checked above -- otherwise `pause()` would have no effect on
+        // scheduled fund movement while every other write path stays blocked.
+        if Self::get_global_paused(&env) {
+            return Vec::new(&env);
+        }
         Self::extend_instance_ttl(&env);
 
         let current_time = env.ledger().timestamp();
