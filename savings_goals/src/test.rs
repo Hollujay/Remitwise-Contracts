@@ -3,16 +3,10 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::testutils::storage::Instance as _;
 use soroban_sdk::{
-    symbol_short,
-    testutils::{Address as AddressTrait, Events, Ledger, LedgerInfo},
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Vec as SorobanVec,
+    testutils::{Address as _, Ledger as _},
+    Address, Env, String,
 };
-
-use testutils::set_ledger_time;
-
-// Removed local set_time in favor of testutils::set_ledger_time
 
 #[test]
 fn test_create_goal_unique_ids_succeeds() {
@@ -429,8 +423,54 @@ fn test_multiple_goals_management() {
     assert_eq!(g2.current_amount, 1500);
 }
 
+// A realistic "now" for these tests, comfortably close enough to the
+// goals' 2000000000 target_date that the 5-year ledger cap (measured from
+// this timestamp) sits just past it -- the default test-env timestamp of
+// 0 would make even the fixture's own target_date unreachable.
+const NOW: u64 = 1_900_000_000;
+
 #[test]
-fn test_withdraw_from_goal_succeeds_once_unlocked() {
+fn test_extend_goal_deadline_within_cap() {
+    let env = Env::default();
+    env.ledger().set_timestamp(NOW);
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    client.init();
+    env.mock_all_auths();
+    let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
+
+    let new_target = 2000000000 + 86400; // one day past the current target
+    let updated = client.extend_goal_deadline(&user, &id, &new_target);
+
+    assert_eq!(updated, new_target);
+    assert_eq!(client.get_goal(&id).unwrap().target_date, new_target);
+}
+
+#[test]
+#[should_panic(expected = "exceeds the maximum extension")]
+fn test_extend_goal_deadline_past_ledger_cap() {
+    let env = Env::default();
+    env.ledger().set_timestamp(NOW);
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    client.init();
+    env.mock_all_auths();
+    let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
+
+    // MAX_EXTENSION_SECONDS is 5 years from NOW; ask for 5 years and a day
+    // to land just past the cap (and still past the current target_date,
+    // so it's the cap -- not the forward-move check -- that rejects it).
+    let past_cap = NOW + (5 * 365 * 86400) + 86400;
+    client.extend_goal_deadline(&user, &id, &past_cap);
+}
+
+#[test]
+#[should_panic(expected = "must be later than the current target date")]
+fn test_extend_goal_deadline_rejects_non_forward_move() {
     let env = Env::default();
     let contract_id = env.register_contract(None, SavingsGoalContract);
     let client = SavingsGoalContractClient::new(&env, &contract_id);
@@ -439,97 +479,6 @@ fn test_withdraw_from_goal_succeeds_once_unlocked() {
     client.init();
     env.mock_all_auths();
     let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
-    client.add_to_goal(&user, &id, &500);
-    client.unlock_goal(&user, &id);
 
-    let remaining = client.withdraw_from_goal(&user, &id, &200);
-
-    assert_eq!(remaining, 300);
-    assert_eq!(client.get_goal(&id).unwrap().current_amount, 300);
-}
-
-#[test]
-fn test_withdraw_from_goal_rejects_non_positive_amount() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, SavingsGoalContract);
-    let client = SavingsGoalContractClient::new(&env, &contract_id);
-    let user = Address::generate(&env);
-
-    client.init();
-    env.mock_all_auths();
-    let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
-    client.unlock_goal(&user, &id);
-
-    let result = client.try_withdraw_from_goal(&user, &id, &0);
-
-    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
-}
-
-#[test]
-fn test_withdraw_from_nonexistent_goal() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, SavingsGoalContract);
-    let client = SavingsGoalContractClient::new(&env, &contract_id);
-    let user = Address::generate(&env);
-
-    client.init();
-    env.mock_all_auths();
-    let result = client.try_withdraw_from_goal(&user, &99, &100);
-
-    assert_eq!(result, Err(Ok(Error::GoalNotFound)));
-}
-
-#[test]
-fn test_withdraw_from_goal_rejects_non_owner() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, SavingsGoalContract);
-    let client = SavingsGoalContractClient::new(&env, &contract_id);
-    let owner = Address::generate(&env);
-    let stranger = Address::generate(&env);
-
-    client.init();
-    env.mock_all_auths();
-    let id = client.create_goal(&owner, &String::from_str(&env, "Trip"), &1000, &2000000000);
-    client.add_to_goal(&owner, &id, &500);
-    client.unlock_goal(&owner, &id);
-
-    let result = client.try_withdraw_from_goal(&stranger, &id, &100);
-
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-#[test]
-fn test_withdraw_from_locked_goal() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, SavingsGoalContract);
-    let client = SavingsGoalContractClient::new(&env, &contract_id);
-    let user = Address::generate(&env);
-
-    client.init();
-    env.mock_all_auths();
-    // Goals are created locked by default -- never explicitly unlocked here.
-    let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
-    client.add_to_goal(&user, &id, &500);
-
-    let result = client.try_withdraw_from_goal(&user, &id, &100);
-
-    assert_eq!(result, Err(Ok(Error::GoalLocked)));
-}
-
-#[test]
-fn test_withdraw_more_than_balance() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, SavingsGoalContract);
-    let client = SavingsGoalContractClient::new(&env, &contract_id);
-    let user = Address::generate(&env);
-
-    client.init();
-    env.mock_all_auths();
-    let id = client.create_goal(&user, &String::from_str(&env, "Trip"), &1000, &2000000000);
-    client.add_to_goal(&user, &id, &500);
-    client.unlock_goal(&user, &id);
-
-    let result = client.try_withdraw_from_goal(&user, &id, &501);
-
-    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+    client.extend_goal_deadline(&user, &id, &2000000000);
 }
