@@ -1341,21 +1341,31 @@ impl Orchestrator {
 
         if savings_amt > 0 {
             let s_client = interface::SavingsGoalsClient::new(env, &routing.savings);
-            if s_client
-                .try_add_to_goal(caller, &routing.goal_id, &savings_amt)
-                .is_err()
-            {
-                return Err(OrchestratorError::CrossContractCallFailed);
+            match s_client.try_add_to_goal(caller, &routing.goal_id, &savings_amt) {
+                Ok(Ok(_)) => savings_done = true,
+                Ok(Err(_)) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), true);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
+                Err(_) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), false);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
             }
-            savings_done = true;
         }
 
         if bills_amt > 0 {
             let b_client = interface::BillPaymentsClient::new(env, &routing.bills);
-            if b_client
-                .try_pay_bill(caller, &routing.bill_id, &bills_amt)
-                .is_err()
-            {
+            let rejected_by_contract = match b_client.try_pay_bill(caller, &routing.bill_id, &bills_amt) {
+                Ok(Ok(_)) => {
+                    bills_done = true;
+                    None
+                }
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("bills"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
@@ -1368,15 +1378,17 @@ impl Orchestrator {
                 }
                 return Err(OrchestratorError::CrossContractCallFailed);
             }
-            bills_done = true;
         }
 
         if insurance_amt > 0 {
             let i_client = interface::InsuranceClient::new(env, &routing.insurance);
-            if i_client
-                .try_pay_premium(caller, &routing.policy_id, &insurance_amt)
-                .is_err()
-            {
+            let rejected_by_contract = match i_client.try_pay_premium(caller, &routing.policy_id, &insurance_amt) {
+                Ok(Ok(_)) => None,
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("insur"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
@@ -1393,6 +1405,22 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    /// Surfaces the inner failure that `run_remittance_fan_out` would otherwise
+    /// swallow behind a single generic [`OrchestratorError::CrossContractCallFailed`].
+    ///
+    /// `step` identifies which downstream call failed; `rejected_by_contract`
+    /// distinguishes a deliberate rejection from the callee's own logic (`true`,
+    /// e.g. its own validation/auth failed) from a lower-level invocation failure
+    /// (`false`, e.g. the address is not a deployed contract with a matching
+    /// interface). Both were previously indistinguishable from the caller's
+    /// perspective.
+    fn emit_cross_contract_failure(env: &Env, step: Symbol, rejected_by_contract: bool) {
+        env.events().publish(
+            (symbol_short!("cctx_err"), step),
+            rejected_by_contract,
+        );
     }
 
     /// Compensate a savings-goal contribution if it was applied.

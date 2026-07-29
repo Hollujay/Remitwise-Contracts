@@ -1038,6 +1038,46 @@ fn test_rollback_savings_step_returns_cross_contract_error() {
 }
 
 #[test]
+fn test_cross_contract_failure_emits_step_and_cause() {
+    // Before this fix, every downstream failure collapsed into the same
+    // generic `CrossContractCallFailed` error with no way to tell which step
+    // failed or whether it was the callee's own logic vs. the invocation
+    // itself. Assert the swallowed information is now surfaced as an event.
+    let (env, owner) = setup_test();
+    let (orchestrator_id, client) = register_orchestrator(&env);
+
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, mock_fail_savings::Contract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+    init_orchestrator_with_mocks(&env, &client, &owner, fw, rs, sg, bp, ins);
+
+    let executor = Address::generate(&env);
+    let deadline = signed_flow_deadline(&env);
+    let hash = signed_flow_hash(&env, &executor, 10000, 0, deadline);
+    let _ =
+        client.try_execute_remittance_flow_signed(&executor, &10000, &0, &deadline, &hash, &0u64);
+
+    let expected_topics = soroban_sdk::vec![
+        &env,
+        symbol_short!("cctx_err").into_val(&env),
+        symbol_short!("savings").into_val(&env),
+    ];
+    let matched: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(cid, topics, _)| cid == &orchestrator_id && *topics == expected_topics)
+        .collect();
+    assert_eq!(matched.len(), 1);
+    // `mock_fail_savings` panics rather than returning a typed error, so this
+    // is an invocation-level failure (`rejected_by_contract == false`).
+    let (_, _, data) = &matched[0];
+    assert_eq!(bool::from_val(&env, data), false);
+}
+
+#[test]
 fn test_rollback_bill_step_triggers_compensation() {
     let (env, owner) = setup_test();
     let (_, client) = register_orchestrator(&env);
