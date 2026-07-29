@@ -1948,8 +1948,7 @@ impl FamilyWallet {
         // expired role timestamp would immediately lock the member out of
         // their role with no way to recover except through admin intervention.
         if let Some(t) = expires_at {
-            let now = env.ledger().timestamp();
-            if t <= now {
+            if remitwise_common::require_future_timestamp(&env, t).is_err() {
                 panic_with_error!(&env, Error::RoleExpiryInPast);
             }
         }
