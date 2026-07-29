@@ -189,10 +189,9 @@ impl EmergencyKillswitch {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
+        let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::GlobalPaused, &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::PausedSince, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::PausedSince, &now);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
         env.events().publish(
             (
@@ -200,7 +199,7 @@ impl EmergencyKillswitch {
                 soroban_sdk::Symbol::new(&env, remitwise_common::events::ACTION_PAUSED_V2),
             ),
             remitwise_common::events::PauseEvent {
-                paused_at: env.ledger().timestamp(),
+                paused_at: now,
                 paused_by: admin.clone(),
             },
         );
@@ -219,7 +218,8 @@ impl EmergencyKillswitch {
             .instance()
             .get(&DataKey::UnpauseSchedule)
             .ok_or(Error::InvalidSchedule)?;
-        if env.ledger().timestamp() < schedule {
+        let now = env.ledger().timestamp();
+        if now < schedule {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::GlobalPaused, &false);
@@ -231,7 +231,7 @@ impl EmergencyKillswitch {
                 soroban_sdk::Symbol::new(&env, remitwise_common::events::ACTION_UNPAUSED_V2),
             ),
             remitwise_common::events::UnpauseEvent {
-                unpaused_at: env.ledger().timestamp(),
+                unpaused_at: now,
                 unpaused_by: admin.clone(),
             },
         );
