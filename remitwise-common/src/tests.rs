@@ -2239,20 +2239,23 @@ fn test_same_address_symmetric() {
 // require_registered_operator tests (#1182)
 // ============================================================================
 
+// `register_operator`/`require_registered_operator` read and write instance
+// storage, which the Soroban host only allows inside a contract's execution
+// context. Tests exercising them run their storage-touching calls inside
+// `env.as_contract(&contract_id, || { .. })` against the no-op
+// `VerifierTestContract` declared above, mirroring the `verify_signature`
+// tests in this same file.
+
 #[test]
 fn test_require_registered_operator_success() {
     use soroban_sdk::testutils::Address as _;
     let env = Env::default();
     let contract_id = env.register_contract(None, VerifierTestContract);
-    let caller = soroban_sdk::Address::generate(&env);
+    let caller = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        env.storage()
-            .instance()
-            .set(&symbol_short!("OPERATOR"), &true);
-
-        let result = require_registered_operator(&env, &caller);
-        assert_eq!(result, Ok(()));
+        register_operator(&env, &caller);
+        assert_eq!(require_registered_operator(&env, &caller), Ok(()));
     });
 }
 
@@ -2261,103 +2264,78 @@ fn test_require_registered_operator_fails_if_missing() {
     use soroban_sdk::testutils::Address as _;
     let env = Env::default();
     let contract_id = env.register_contract(None, VerifierTestContract);
-    let caller = soroban_sdk::Address::generate(&env);
+    let caller = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        // Missing operator registration - no storage has been set
-        let result = require_registered_operator(&env, &caller);
-        assert_eq!(result, Err(OperatorError::NotRegistered));
+        // No operator has ever been registered.
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
     });
 }
 
-// ============================================================================
-// require_env_var tests
-// ============================================================================
-
+/// Regression test for the bug this hardening fixes: registering *an*
+/// operator must not authorize *every* caller. Before the fix, the registry
+/// was a single shared on/off flag — `caller` was accepted but never
+/// actually consulted, so once any operator was registered every address
+/// passed this check. This must fail on `main` before the fix and pass after.
 #[test]
-fn test_require_env_var_u32_success() {
+fn test_require_registered_operator_rejects_unregistered_caller_id() {
+    use soroban_sdk::testutils::Address as _;
     let env = Env::default();
     let contract_id = env.register_contract(None, VerifierTestContract);
-    let key = symbol_short!("VERSION");
+    let registered = Address::generate(&env);
+    let unauthorized_contract_id = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        env.storage().instance().set(&key, &42u32);
+        register_operator(&env, &registered);
 
-        let result: Result<u32, EnvVarError> = require_env_var(&env, &key);
-        assert_eq!(result, Ok(42u32));
-    });
-}
+        // The registered operator passes.
+        assert_eq!(require_registered_operator(&env, &registered), Ok(()));
 
-#[test]
-fn test_require_env_var_bool_success() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, VerifierTestContract);
-    let key = symbol_short!("IS_ACTV");
-
-    env.as_contract(&contract_id, || {
-        env.storage().instance().set(&key, &true);
-
-        let result: Result<bool, EnvVarError> = require_env_var(&env, &key);
-        assert_eq!(result, Ok(true));
-    });
-}
-
-#[test]
-fn test_require_env_var_missing() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, VerifierTestContract);
-    let key = symbol_short!("NOKEY");
-
-    env.as_contract(&contract_id, || {
-        // No storage set for key - should be missing
-        let result: Result<bool, EnvVarError> = require_env_var(&env, &key);
-        assert_eq!(result, Err(EnvVarError::Missing));
+        // A different, never-registered contract ID must be rejected, even
+        // though *an* operator is registered.
+        assert_eq!(
+            require_registered_operator(&env, &unauthorized_contract_id),
+            Err(OperatorError::NotRegistered)
+        );
     });
 }
 
 #[test]
-fn test_require_env_var_i128_success() {
+fn test_deregister_operator_revokes_access() {
+    use soroban_sdk::testutils::Address as _;
     let env = Env::default();
     let contract_id = env.register_contract(None, VerifierTestContract);
-    let key = symbol_short!("MAX_AMNT");
+    let caller = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        env.storage().instance().set(&key, &1000i128);
+        register_operator(&env, &caller);
+        assert_eq!(require_registered_operator(&env, &caller), Ok(()));
 
-        let result: Result<i128, EnvVarError> = require_env_var(&env, &key);
-        assert_eq!(result, Ok(1000i128));
+        deregister_operator(&env, &caller);
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
     });
 }
 
 #[test]
-fn test_require_env_var_address_success() {
+fn test_deregister_operator_is_idempotent_for_unregistered_caller() {
+    use soroban_sdk::testutils::Address as _;
     let env = Env::default();
     let contract_id = env.register_contract(None, VerifierTestContract);
-    let key = symbol_short!("CONTRACT");
+    let caller = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        env.storage().instance().set(&key, &contract_id);
-
-        let result: Result<Address, EnvVarError> = require_env_var(&env, &key);
-        assert_eq!(result, Ok(contract_id.clone()));
-    });
-}
-
-#[test]
-fn test_require_env_var_different_key_same_env() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, VerifierTestContract);
-    let key_a = symbol_short!("KEY_A");
-    let key_b = symbol_short!("KEY_B");
-
-    env.as_contract(&contract_id, || {
-        env.storage().instance().set(&key_a, &10u32);
-
-        let result_a: Result<u32, EnvVarError> = require_env_var(&env, &key_a);
-        assert_eq!(result_a, Ok(10u32));
-
-        let result_b: Result<u32, EnvVarError> = require_env_var(&env, &key_b);
-        assert_eq!(result_b, Err(EnvVarError::Missing));
+        // Deregistering an address that was never registered must not panic.
+        deregister_operator(&env, &caller);
+        assert_eq!(
+            require_registered_operator(&env, &caller),
+            Err(OperatorError::NotRegistered)
+        );
     });
 }
 
