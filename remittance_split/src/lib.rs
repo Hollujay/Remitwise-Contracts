@@ -15,20 +15,9 @@ use remitwise_common::{
     PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
-    Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
-};
+mod fee_math;
 
-// Event topics
-const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
-const SPLIT_CALCULATED: Symbol = symbol_short!("calc");
-
-// Request hash domain separator for signing (prevents cross-domain attacks)
-const DISTRIBUTE_USDC_DOMAIN: &[u8] = b"distribute_usdc_v1";
-
-// Event data structures
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 #[contracttype]
 pub struct SplitInitializedEvent {
     pub spending_percent: u32,
@@ -1513,15 +1502,12 @@ impl RemittanceSplit {
             None => return Err(RemittanceSplitError::Overflow),
         };
 
-        let spending = Self::floor_percentage(total_amount, s0)?;
-        let savings = Self::floor_percentage(total_amount, s1)?;
-        let bills = Self::floor_percentage(total_amount, s2)?;
-        // Insurance gets the remainder to handle rounding
-        let insurance = total_amount
-            .checked_sub(spending)
-            .and_then(|n| n.checked_sub(savings))
-            .and_then(|n| n.checked_sub(bills))
-            .ok_or(RemittanceSplitError::Overflow)?;
+        let (spending, savings, bills, insurance) = fee_math::split_amounts(
+            total_amount,
+            split.get(0).unwrap(),
+            split.get(1).unwrap(),
+            split.get(2).unwrap(),
+        );
 
         // Emit SplitCalculated event
 
