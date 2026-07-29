@@ -365,44 +365,47 @@ impl ExportSnapshot {
     /// Compute the SHA-256 checksum for this snapshot.
     pub fn compute_checksum(&self) -> Result<String, MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        Ok(Self::checksum_for_parts(
-            self.header.version,
-            &self.header.format,
-            &payload_bytes,
-        ))
+        Ok(self.compute_checksum_bytes(&payload_bytes))
     }
 
+    fn compute_checksum_bytes(&self, payload_bytes: &[u8]) -> String {
+        Self::checksum_for_parts(self.header.version, &self.header.format, payload_bytes)
+    }
+
+    fn compute_simple_checksum_bytes(&self, payload_bytes: &[u8]) -> String {
+        Self::simple_checksum_for_parts(self.header.version, &self.header.format, payload_bytes)
+    }
+
+    #[cfg(test)]
     fn compute_simple_checksum(&self) -> Result<String, MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        Ok(Self::simple_checksum_for_parts(
-            self.header.version,
-            &self.header.format,
-            &payload_bytes,
-        ))
-    }
-
-    fn compute_legacy_simple_checksum(&self) -> Result<String, MigrationError> {
-        let payload_bytes = self.payload_bytes()?;
-        Ok(Self::legacy_simple_checksum(&payload_bytes))
+        Ok(self.compute_simple_checksum_bytes(&payload_bytes))
     }
 
     /// Verify that the stored checksum matches the current payload.
     pub fn verify_checksum(&self) -> bool {
+        match self.payload_bytes() {
+            Ok(payload_bytes) => self.verify_checksum_bytes(&payload_bytes),
+            Err(_) => false,
+        }
+    }
+
+    /// Same as [`verify_checksum`], but reuses an already-computed
+    /// `payload_bytes` (the canonical serialization that both the checksum
+    /// and the payload-bounds check independently need) instead of
+    /// re-deriving it. `payload_bytes` is invariant for a given `&self`, so
+    /// callers that already have it (e.g. [`validate_for_import`]) should
+    /// call this instead of [`verify_checksum`] to avoid re-running the
+    /// canonicalization pass.
+    fn verify_checksum_bytes(&self, payload_bytes: &[u8]) -> bool {
         match self.header.hash_algorithm {
-            ChecksumAlgorithm::Sha256 => self
-                .compute_checksum()
-                .map(|c| self.header.checksum == c)
-                .unwrap_or(false),
-            ChecksumAlgorithm::Simple => self
-                .compute_simple_checksum()
-                .map(|expected| {
-                    self.header.checksum == expected
-                        || self
-                            .compute_legacy_simple_checksum()
-                            .map(|legacy| self.header.checksum == legacy)
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false),
+            ChecksumAlgorithm::Sha256 => {
+                self.header.checksum == self.compute_checksum_bytes(payload_bytes)
+            }
+            ChecksumAlgorithm::Simple => {
+                self.header.checksum == self.compute_simple_checksum_bytes(payload_bytes)
+                    || self.header.checksum == Self::legacy_simple_checksum(payload_bytes)
+            }
         }
     }
 
@@ -414,7 +417,16 @@ impl ExportSnapshot {
     /// Validate payload size and logical record bounds.
     pub fn validate_payload_constraints(&self) -> Result<(), MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        validate_payload_bounds(self.payload.record_count(), payload_bytes.len())
+        Self::validate_payload_constraints_bytes(&self.payload, &payload_bytes)
+    }
+
+    /// Same as [`validate_payload_constraints`], but reuses an
+    /// already-computed `payload_bytes` -- see [`verify_checksum_bytes`].
+    fn validate_payload_constraints_bytes(
+        payload: &SnapshotPayload,
+        payload_bytes: &[u8],
+    ) -> Result<(), MigrationError> {
+        validate_payload_bounds(payload.record_count(), payload_bytes.len())
     }
 
     /// Validate snapshot for import: version, payload bounds, checksum, and semantic invariants.
@@ -447,7 +459,11 @@ impl ExportSnapshot {
             });
         }
 
-        self.validate_payload_constraints()?;
+        // Computed once and reused for both the bounds check and the
+        // checksum verification below, instead of each independently
+        // re-running the canonical serialization pass over the payload.
+        let payload_bytes = self.payload_bytes()?;
+        Self::validate_payload_constraints_bytes(&self.payload, &payload_bytes)?;
 
         if !matches!(
             self.header.hash_algorithm,
@@ -456,7 +472,7 @@ impl ExportSnapshot {
             return Err(MigrationError::UnknownHashAlgorithm);
         }
 
-        if !self.verify_checksum() {
+        if !self.verify_checksum_bytes(&payload_bytes) {
             return Err(MigrationError::ChecksumMismatch);
         }
 
