@@ -2723,6 +2723,59 @@ impl RemittanceSplit {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
+ validate/rotate-admin-same-address
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _},
+        token::{StellarAssetClient, TokenClient},
+        Env, TryFromVal,
+    };
+
+    #[test]
+    fn distribute_usdc_apportions_tokens_to_recipients() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RemittanceSplit);
+        let client = RemittanceSplitClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let payer = Address::generate(&env);
+        let amount = 1_000i128;
+
+        StellarAssetClient::new(&env, &token_contract.address()).mint(&payer, &amount);
+
+        let spending = Address::generate(&env);
+        let savings = Address::generate(&env);
+        let bills = Address::generate(&env);
+        let insurance = Address::generate(&env);
+
+        let accounts = AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        };
+
+        let distributed =
+            client.distribute_usdc(&token_contract.address(), &payer, &accounts, &amount);
+
+        assert!(distributed);
+
+        let token_client = TokenClient::new(&env, &token_contract.address());
+        assert_eq!(token_client.balance(&spending), 500);
+        assert_eq!(token_client.balance(&savings), 300);
+        assert_eq!(token_client.balance(&bills), 150);
+        assert_eq!(token_client.balance(&insurance), 50);
+        assert_eq!(token_client.balance(&payer), 0);
+    }
+
+=======
+ main
     /// Create a new automatic remittance schedule for the split owner.
     ///
     /// # Arguments
