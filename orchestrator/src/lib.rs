@@ -92,7 +92,8 @@ pub enum FlowStep {
 }
 
 use remitwise_common::{
-    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 
 // Storage TTL constants for active data
@@ -1071,6 +1072,23 @@ impl Orchestrator {
         env.storage()
             .persistent()
             .set(&symbol_short!("SNAP_TS"), &env.ledger().timestamp());
+        // The only other extend_ttl call in this contract targets the
+        // *instance* bucket (see `extend_instance_ttl`); it does not, and
+        // cannot, keep this *persistent* entry alive. Without bumping the
+        // persistent bucket's own TTL here, the snapshot can be archived off
+        // the ledger and `restore_from_snapshot` starts failing with
+        // `InvalidDependency` well before `PERSISTENT_LIFETIME_THRESHOLD`
+        // would suggest, even while the instance itself is still healthy.
+        env.storage().persistent().extend_ttl(
+            &SNAPSHOT_KEY,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().extend_ttl(
+            &symbol_short!("SNAP_TS"),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("snap_pre")),
             SNAPSHOT_VERSION,

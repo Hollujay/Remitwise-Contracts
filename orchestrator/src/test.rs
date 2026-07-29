@@ -1477,6 +1477,31 @@ fn test_pre_upgrade_roundtrip() {
 }
 
 #[test]
+fn test_pre_upgrade_bumps_persistent_snapshot_ttl() {
+    // Before this fix, pre_upgrade wrote SNAPSHOT_KEY / SNAP_TS to the
+    // *persistent* bucket but only ever called extend_ttl on the *instance*
+    // bucket elsewhere in the contract -- the persistent entry's TTL was
+    // never bumped at all, so it could be archived off the ledger (breaking
+    // restore_from_snapshot) well before the instance itself expired.
+    use soroban_sdk::testutils::storage::Persistent;
+
+    let (env, owner) = setup_test();
+    let (orchestrator_id, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
+    env.ledger().with_mut(|li| li.max_entry_ttl = 6_000_000);
+
+    client.pre_upgrade(&owner);
+
+    let ttl = env.as_contract(&orchestrator_id, || {
+        env.storage().persistent().get_ttl(&SNAPSHOT_KEY)
+    });
+    assert_eq!(
+        ttl, PERSISTENT_BUMP_AMOUNT,
+        "persistent snapshot entry must be bumped with the persistent bucket's amount"
+    );
+}
+
+#[test]
 fn test_pre_upgrade_unauthorized_fails() {
     let (env, owner) = setup_test();
     let (_, client) = register_orchestrator(&env);
