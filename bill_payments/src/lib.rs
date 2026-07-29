@@ -1,13 +1,30 @@
 #![no_std]
-#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-
-use remitwise_common::reversible_op::{BillPaymentsReversible, ReversibleOpError};
-use remitwise_common::{
-    check_and_increment_rate_limit, clamp_limit, require_stable_currency,
-    require_within_settlement_window, EventCategory, EventPriority, RemitwiseEvents, Timestamp,
-    ARCHIVE_BUMP_AMOUNT, ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY,
-    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_CURRENCY_LEN,
-    MAX_SETTLEMENT_WINDOW_SECS, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+//! ## Storage-key layout
+//!
+//! All contract state lives in **instance storage** under two
+//! `symbol_short!` keys (short symbols are capped at 9 characters, which is
+//! why `NEXT_ID` and `BILLS` -- not more descriptive names -- are used):
+//!
+//! - `NEXT_ID: u32` -- a monotonically increasing counter. It only ever
+//!   increases (on `create_bill`, and again on the auto-created next bill
+//!   inside `pay_bill` when a recurring bill comes due); it is never
+//!   decremented, even when the bill it was minted for is later removed via
+//!   `cancel_bill`. This makes `NEXT_ID` an upper bound on bill ids that
+//!   have ever existed, not a count of bills that currently exist.
+//! - `BILLS: Map<u32, Bill>` -- every bill ever created, keyed by the id it
+//!   was minted with. **Ids in this map are not contiguous**: `cancel_bill`
+//!   removes an entry outright rather than tombstoning it, so `1..=NEXT_ID`
+//!   is a valid *iteration range* (see `get_all_bills`, `get_unpaid_bills`,
+//!   `get_overdue_bills`) but must always be probed with `Map::get` --
+//!   never assumed to be present -- since cancelled ids leave gaps.
+//!
+//! Both keys share one TTL, bumped together by `extend_instance_ttl` on
+//! every write. There is no per-bill TTL: a single bill cannot outlive (or
+//! be evicted independently of) the rest of this contract's instance
+//! storage.
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    Vec,
 };
 
 use soroban_sdk::{
