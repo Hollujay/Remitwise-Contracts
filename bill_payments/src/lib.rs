@@ -35,10 +35,7 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-/// Contract-specific type alias for ergonomic error handling.
-/// Maps to the crate's own error type to keep every `Result<_, Error>`
-/// from needing a `use crate::BillPaymentsError` at every call site.
-pub type Error = BillPaymentsError;
+
 
 /// Validates that a currency string consists entirely of ASCII alphabetic characters.
 /// This is a first-pass sanity check that rejects non-letter characters before
@@ -47,25 +44,8 @@ fn is_valid_currency_chars(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&b| b.is_ascii_alphabetic())
 }
 
-const MAX_FREQUENCY_DAYS: u32 = 36_500; // 100 years
-const SECONDS_PER_DAY: u64 = 86_400;
-pub const MAX_BILLS_PER_OWNER: u32 = 1_000;
-/// Maximum length for bill names in bytes (defence-in-depth: prevents
-/// unbounded storage bloat via excessively long names).
-const MAX_NAME_LEN: u32 = 64;
-
-/// Rate limits for bill payments operations
-pub const CREATE_BILL_RATE_LIMIT: u32 = 100; // per address per 24h
-pub const PAY_BILL_RATE_LIMIT: u32 = 200; // per address per 24h
-pub const CANCEL_BILL_RATE_LIMIT: u32 = 50; // per address per 24h
-const MIN_EXTERNAL_REF_LEN: u32 = 1;
-const MAX_EXTERNAL_REF_LEN: u32 = 64;
-const MIN_SCHEDULE_INTERVAL: u64 = 3_600;
-const MAX_SCHEDULE_LEAD_TIME: u64 = 365 * 24 * 3_600;
-const MAX_BILL_SCHEDULES_PER_OWNER: u32 = 50;
-/// Admin grant time-to-live in seconds (30 days). After this period the pause admin
-/// must call set_pause_admin or refresh_admin_grant to extend the grant.
-const ADMIN_GRANT_TTL: u64 = 30 * 24 * 60 * 60;
+pub mod params;
+pub use params::*;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -423,7 +403,7 @@ pub struct PreUpgradeSnapshot {
 /// watching `AdminEvent::RotationProposed`) time to notice the proposal
 /// and respond, rather than a single signature being an irreversible,
 /// instant takeover.
-const ADMIN_ROTATION_TIMELOCK_SECONDS: u64 = 2 * 86400; // 2 days
+
 
 /// A rotation that has been proposed but not yet finalized.
 #[derive(Clone, Debug, PartialEq)]
