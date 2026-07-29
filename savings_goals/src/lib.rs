@@ -5,15 +5,28 @@ use remitwise_common::{
     EventCategory, EventPriority, RemitwiseEvents, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Map, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    Symbol, Vec,
 };
 
-// Event topics
-const GOAL_CREATED: Symbol = symbol_short!("created");
-const GOAL_COMPLETED: Symbol = symbol_short!("completed");
-const FUNDS_ADDED: Symbol = symbol_short!("funds_add");
-const FUNDS_WITHDRAWN: Symbol = symbol_short!("funds_rem");
+/// Mirrors `bill_payments::Error`'s naming convention (`*NotFound`,
+/// `InvalidAmount`, `Unauthorized`) so the two neighbouring contracts
+/// report failures the same way instead of one panicking with a string
+/// and the other returning a typed error.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    GoalNotFound = 1,
+    GoalLocked = 2,
+    InvalidAmount = 3,
+    InsufficientBalance = 4,
+    Unauthorized = 5,
+}
+
+// Storage TTL constants
+const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
+const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
 
 #[derive(Clone)]
 #[contracttype]
@@ -1462,53 +1475,26 @@ impl SavingsGoalContract {
     /// * `amount` - Amount to withdraw in stroops (must be > 0)
     ///
     /// # Returns
-    /// `Ok(remaining_amount)` - The remaining amount in the goal after withdrawal
+    /// Ok(updated current amount)
     ///
     /// # Errors
-    /// * `InvalidAmount` - If amount ≤ 0
-    /// * `GoalNotFound` - If goal_id does not exist
+    /// * `InvalidAmount` - If amount is not positive
+    /// * `GoalNotFound` - If goal with given ID doesn't exist
     /// * `Unauthorized` - If caller is not the goal owner
-    /// * `GoalLocked` - If goal is locked or time-locked
-    /// * `InsufficientBalance` - If amount > current_amount
-    /// * `Overflow` - If subtraction would underflow i128
-    ///
-    /// # Panics
-    /// * If `caller` does not authorize the transaction
-    /// Withdraws funds from an existing savings goal.
-    ///
-    /// # Arguments
-    /// * `caller` - Address of the goal owner (must authorize)
-    /// * `goal_id` - ID of the goal to withdraw from
-    /// * `amount` - Amount to withdraw in stroops (must be > 0)
-    ///
-    /// # Returns
-    /// `Ok(remaining_amount)` - The remaining amount in the goal after withdrawal
-    ///
-    /// # Errors
-    /// * `InvalidAmount` - If amount ≤ 0
-    /// * `GoalNotFound` - If goal_id does not exist
-    /// * `Unauthorized` - If caller is not the goal owner
-    /// * `InsufficientBalance` - If amount > current_amount
-    /// * `GoalLocked` - If the goal is locked or time-lock has not expired
-    ///
-    /// # Time-lock Behavior
-    /// - If `unlock_date` is set, withdrawal will fail if `env.ledger().timestamp() < unlock_date`.
-    /// - Boundary condition: Success if `timestamp == unlock_date`.
-    ///
-    /// # Events
-    /// - Emits `SavingsEvent::FundsWithdrawn`.
+    /// * `GoalLocked` - If the goal is locked
+    /// * `InsufficientBalance` - If amount exceeds the current balance
     pub fn withdraw_from_goal(
         env: Env,
         caller: Address,
         goal_id: u32,
         amount: i128,
-    ) -> Result<i128, SavingsGoalError> {
+    ) -> Result<i128, Error> {
+        // Access control: require caller authorization
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::WITHDRAW);
 
         if amount <= 0 {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::InvalidAmount);
+            return Err(Error::InvalidAmount);
         }
 
         Self::extend_instance_ttl(&env);
@@ -1525,27 +1511,19 @@ impl SavingsGoalContract {
             }
         };
 
+        let mut goal = goals.get(goal_id).ok_or(Error::GoalNotFound)?;
+
+        // Access control: verify caller is the owner
         if goal.owner != caller {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::Unauthorized);
+            return Err(Error::Unauthorized);
         }
 
         if goal.locked {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::GoalLocked);
-        }
-
-        if let Some(unlock_date) = goal.unlock_date {
-            let current_time = env.ledger().timestamp();
-            if current_time < unlock_date {
-                Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-                return Err(SavingsGoalError::GoalLocked);
-            }
+            return Err(Error::GoalLocked);
         }
 
         if amount > goal.current_amount {
-            Self::append_audit(&env, symbol_short!("withdraw"), &caller, false);
-            return Err(SavingsGoalError::InsufficientBalance);
+            return Err(Error::InsufficientBalance);
         }
 
         goal.current_amount = goal
