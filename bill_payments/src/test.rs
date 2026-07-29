@@ -4485,21 +4485,64 @@ fn test_set_external_ref_owner_can_set() {
 
         set_time(&env, 1_000);
         env.mock_all_auths();
-        client.init_admin(&admin);
+        client.init_admin(&admin, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
         client.propose_admin_rotation(&admin, &new_admin);
 
         // Still before the timelock elapses.
-        set_time(&env, 1_000 + ADMIN_ROTATION_TIMELOCK_SECONDS - 1);
+        set_time(&env, 1_000 + DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS - 1);
         let too_early = client.try_finalize_admin_rotation();
         assert_eq!(too_early, Err(Ok(Error::TimelockNotElapsed)));
         assert_eq!(client.get_admin(), Some(admin.clone()));
 
         // Timelock has now elapsed.
-        set_time(&env, 1_000 + ADMIN_ROTATION_TIMELOCK_SECONDS);
+        set_time(&env, 1_000 + DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
         client.finalize_admin_rotation();
 
         assert_eq!(client.get_admin(), Some(new_admin));
         assert_eq!(client.get_pending_admin_rotation(), None);
+    }
+
+    /// The whole point of this issue: a deployment can configure a
+    /// different timelock than the default, and that configured value —
+    /// not the default — is what actually gates `finalize_admin_rotation`.
+    #[test]
+    fn test_init_admin_configures_a_custom_rotation_timelock() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        let new_admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        let custom_timelock: u64 = MIN_SCHEDULE_INTERVAL * 2; // 2 hours, well under the 2-day default
+        set_time(&env, 1_000);
+        env.mock_all_auths();
+        client.init_admin(&admin, &custom_timelock);
+        assert_eq!(client.get_admin_rotation_timelock(), custom_timelock);
+
+        client.propose_admin_rotation(&admin, &new_admin);
+
+        // Would still be pending under the default (2-day) timelock, but the
+        // custom (2-hour) timelock has elapsed.
+        set_time(&env, 1_000 + custom_timelock);
+        client.finalize_admin_rotation();
+        assert_eq!(client.get_admin(), Some(new_admin));
+    }
+
+    /// A timelock below `MIN_SCHEDULE_INTERVAL` would defeat the whole
+    /// purpose of the window (giving the legitimate admin time to react) and
+    /// must be rejected at `init_admin`, before any state is set.
+    #[test]
+    fn test_init_admin_rejects_too_short_a_rotation_timelock() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let result = client.try_init_admin(&admin, &(MIN_SCHEDULE_INTERVAL - 1));
+
+        assert_eq!(result, Err(Ok(Error::RotationTimelockTooShort)));
+        assert_eq!(client.get_admin(), None);
     }
 
     #[test]
@@ -4512,7 +4555,7 @@ fn test_set_external_ref_owner_can_set() {
         let new_admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
 
         env.mock_all_auths();
-        client.init_admin(&admin);
+        client.init_admin(&admin, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
 
         let result = client.try_propose_admin_rotation(&stranger, &new_admin);
 
@@ -4527,7 +4570,7 @@ fn test_set_external_ref_owner_can_set() {
         let admin = <soroban_sdk::Address as AddressTrait>::generate(&env);
 
         env.mock_all_auths();
-        client.init_admin(&admin);
+        client.init_admin(&admin, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
 
         let result = client.try_finalize_admin_rotation();
 
@@ -4543,9 +4586,9 @@ fn test_set_external_ref_owner_can_set() {
         let other = <soroban_sdk::Address as AddressTrait>::generate(&env);
 
         env.mock_all_auths();
-        client.init_admin(&admin);
+        client.init_admin(&admin, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
 
-        let result = client.try_init_admin(&other);
+        let result = client.try_init_admin(&other, &DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
 
         assert_eq!(result, Err(Ok(Error::AdminAlreadyInitialized)));
     }
