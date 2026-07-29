@@ -15,6 +15,14 @@ fn setup(env: &Env) -> (Address, EmergencyKillswitchClient<'_>) {
 }
 
 #[test]
+fn version_returns_contract_version_without_init() {
+    let env = Env::default();
+    let (_, client) = setup(&env);
+    // Observable on-chain with no auth and before initialize().
+    assert_eq!(client.version(), emergency_killswitch::CONTRACT_VERSION);
+}
+
+#[test]
 fn initialize_rejects_self_address() {
     let env = Env::default();
     env.mock_all_auths();
