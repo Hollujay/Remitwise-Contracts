@@ -158,7 +158,7 @@ impl EmergencyKillswitch {
         if new_admin == env.current_contract_address() {
             return Err(Error::InvalidAdmin);
         }
-        if new_admin == admin {
+        if remitwise_common::same_address(&new_admin, &admin) {
             return Err(Error::InvalidAdmin);
         }
 
