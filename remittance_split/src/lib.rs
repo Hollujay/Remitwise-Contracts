@@ -188,7 +188,29 @@ pub const MAX_SCHEDULE_LEAD_TIME: u64 = 365 * 24 * 3_600;
 /// Maximum allowed window for transaction deadlines (1 hour).
 pub const MAX_DEADLINE_WINDOW_SECS: u64 = 3_600;
 
-/// Split configuration with owner tracking for access control
+/// Split configuration with owner tracking for access control.
+///
+/// ## How the split is computed
+///
+/// There is no separate platform "fee" charged on top of a remittance --
+/// the four percentages below (which must sum to exactly 100, enforced in
+/// both `initialize_split` and `update_split`) *are* the fee schedule: each
+/// category's share of `total_amount` is computed in `calculate_split` as
+/// `total_amount * percent / 100`, using integer (truncating) division for
+/// `spending`, `savings`, and `bills`. `insurance` deliberately does **not**
+/// use that same formula -- it takes whatever is left over
+/// (`total_amount - spending - savings - bills`) so the four amounts always
+/// sum back to exactly `total_amount` with no stroop lost to truncation.
+///
+/// ## Where it's stored
+///
+/// Persisted in **instance storage** under two keys, both written together
+/// on every `initialize_split`/`update_split` call and sharing one TTL:
+/// - `CONFIG: SplitConfig` -- the source of truth, including `owner`.
+/// - `SPLIT: Vec<u32>` -- just the four percentages, kept in sync with
+///   `CONFIG` for callers that only need `get_split`'s cheaper read. It
+///   predates `CONFIG` and is retained for backward compatibility; new
+///   code should prefer `get_config` when it needs the owner too.
 #[derive(Clone)]
 #[contracttype]
 pub struct SplitConfig {
