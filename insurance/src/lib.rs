@@ -41,13 +41,12 @@ pub struct PolicyPage {
 
 #[contracttype]
 #[derive(Clone)]
-pub struct PolicyCreatedEvent {
-    pub policy_id: u32,
-    pub name: String,
-    pub coverage_type: CoverageType,
-    pub monthly_premium: i128,
-    pub coverage_amount: i128,
-    pub timestamp: u64,
+pub enum InsuranceEvent {
+    PolicyCreated,
+    PremiumPaid,
+    PolicyDeactivated,
+    EmergencyShutdown,
+    Resumed,
 }
 
 #[contracttype]
@@ -206,7 +205,125 @@ pub struct Insurance;
 
 #[contractimpl]
 impl Insurance {
-    // ── Initialization ───────────────────────────────────────────────────────
+    /// One-time setup for the address allowed to trigger emergency
+    /// shutdown.
+    ///
+    /// # Panics
+    /// - If the pause admin has already been set
+    pub fn init_pause_admin(env: Env, admin: Address) {
+        admin.require_auth();
+
+        if env.storage().instance().has(&symbol_short!("PADMIN")) {
+            panic!("Pause admin already initialized");
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PADMIN"), &admin);
+    }
+
+    /// ## The emergency-shutdown flow
+    ///
+    /// Halts every state-changing action that creates a new financial
+    /// commitment -- `create_policy` (new coverage) and `pay_premium`
+    /// (money moving) both check `PAUSED` and refuse to run while it's
+    /// set. Deliberately **not** blocked: `deactivate_policy`, so a policy
+    /// owner can still exit their own coverage during a shutdown instead
+    /// of being frozen into it, and every read-only getter, so the
+    /// contract's state stays inspectable throughout.
+    ///
+    /// Only the address set by `init_pause_admin` may call this or
+    /// `resume`. There is no timelock here (contrast with
+    /// `bill_payments::finalize_admin_rotation`) -- the entire point of an
+    /// emergency shutdown is to take effect immediately, in response to
+    /// something already going wrong.
+    ///
+    /// # Panics
+    /// - If the pause admin hasn't been initialized
+    /// - If caller is not the pause admin
+    pub fn emergency_shutdown(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_pause_admin(&env, &caller);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PAUSED"), &true);
+        env.events().publish(
+            (symbol_short!("admin"), InsuranceEvent::EmergencyShutdown),
+            caller,
+        );
+    }
+
+    /// Lift a shutdown triggered by `emergency_shutdown`.
+    ///
+    /// # Panics
+    /// - If the pause admin hasn't been initialized
+    /// - If caller is not the pause admin
+    pub fn resume(env: Env, caller: Address) {
+        caller.require_auth();
+        Self::require_pause_admin(&env, &caller);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PAUSED"), &false);
+        env.events()
+            .publish((symbol_short!("admin"), InsuranceEvent::Resumed), caller);
+    }
+
+    /// Whether the contract is currently in an emergency shutdown.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("PAUSED"))
+            .unwrap_or(false)
+    }
+
+    fn require_pause_admin(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PADMIN"))
+            .expect("Pause admin not initialized");
+
+        if &admin != caller {
+            panic!("Only the pause admin can do this");
+        }
+    }
+
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("Contract is in emergency shutdown");
+        }
+    }
+
+    /// Create a new insurance policy
+    ///
+    /// # Arguments
+    /// * `owner` - Address of the policy owner (must authorize)
+    /// * `name` - Name of the policy
+    /// * `coverage_type` - Type of coverage (e.g., "health", "emergency")
+    /// * `monthly_premium` - Monthly premium amount (must be positive)
+    /// * `coverage_amount` - Total coverage amount (must be positive)
+    ///
+    /// # Returns
+    /// The ID of the created policy
+    ///
+    /// # Panics
+    /// - If owner doesn't authorize the transaction
+    /// - If monthly_premium is not positive
+    /// - If coverage_amount is not positive
+    pub fn create_policy(
+        env: Env,
+        owner: Address,
+        name: String,
+        coverage_type: String,
+        monthly_premium: i128,
+        coverage_amount: i128,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+
+        // Access control: require owner authorization
+        owner.require_auth();
 
     /// Initialize the insurance contract with the given owner.
     ///
@@ -226,7 +343,24 @@ impl Insurance {
         Ok(())
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
+    /// Pay monthly premium for a policy
+    ///
+    /// # Arguments
+    /// * `caller` - Address of the caller (must be the policy owner)
+    /// * `policy_id` - ID of the policy
+    ///
+    /// # Returns
+    /// True if payment was successful
+    ///
+    /// # Panics
+    /// - If caller is not the policy owner
+    /// - If policy is not found
+    /// - If policy is not active
+    pub fn pay_premium(env: Env, caller: Address, policy_id: u32) -> bool {
+        Self::require_not_paused(&env);
+
+        // Access control: require caller authorization
+        caller.require_auth();
 
     fn require_initialized(env: &Env) -> Result<(), InsuranceError> {
         if !env.storage().instance().has(&DataKey::Initialized) {
@@ -1745,5 +1879,107 @@ mod tests {
         let discounted = client.calculate_discounted_premium(&policy_id, &1_000, &920);
 
         assert_eq!(discounted, 900);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn open_policy(env: &Env, client: &InsuranceClient, owner: &Address) -> u32 {
+        client.create_policy(
+            owner,
+            &String::from_str(env, "Health"),
+            &String::from_str(env, "health"),
+            &100,
+            &10_000,
+        )
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is in emergency shutdown")]
+    fn emergency_shutdown_blocks_new_policies() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+
+        let pause_admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        client.init_pause_admin(&pause_admin);
+
+        client.emergency_shutdown(&pause_admin);
+        assert!(client.is_paused());
+
+        open_policy(&env, &client, &owner);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is in emergency shutdown")]
+    fn emergency_shutdown_blocks_premium_payments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+
+        let pause_admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        client.init_pause_admin(&pause_admin);
+        let policy_id = open_policy(&env, &client, &owner);
+
+        client.emergency_shutdown(&pause_admin);
+        client.pay_premium(&owner, &policy_id);
+    }
+
+    #[test]
+    fn resume_allows_state_changes_again() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+
+        let pause_admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        client.init_pause_admin(&pause_admin);
+
+        client.emergency_shutdown(&pause_admin);
+        client.resume(&pause_admin);
+
+        assert!(!client.is_paused());
+        open_policy(&env, &client, &owner); // does not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the pause admin can do this")]
+    fn only_the_pause_admin_can_shut_down() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+
+        let pause_admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.init_pause_admin(&pause_admin);
+
+        client.emergency_shutdown(&stranger);
+    }
+
+    #[test]
+    fn deactivate_policy_is_not_blocked_by_a_shutdown() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+
+        let pause_admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        client.init_pause_admin(&pause_admin);
+        let policy_id = open_policy(&env, &client, &owner);
+
+        client.emergency_shutdown(&pause_admin);
+        client.deactivate_policy(&owner, &policy_id); // does not panic
+
+        assert!(!client.get_policy(&policy_id).unwrap().active);
     }
 }
