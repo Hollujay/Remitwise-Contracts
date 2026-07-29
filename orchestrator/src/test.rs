@@ -1011,6 +1011,81 @@ fn signed_flow_hash(
     compute_test_hash(_env, symbol_short!("flow"), nonce, amount, deadline)
 }
 
+// ---------------------------------------------------------------------------
+// Configurable deadline window (init_with_deadline_window)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_deadline_window_defaults_to_max_when_plain_init_used() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
+
+    assert_eq!(client.get_deadline_window(), MAX_DEADLINE_WINDOW_SECS);
+}
+
+#[test]
+fn init_with_deadline_window_rejects_zero_window() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+
+    let result =
+        client.try_init_with_deadline_window(&owner, &fw, &rs, &sg, &bp, &ins, &0u64);
+    assert_eq!(result, Err(Ok(OrchestratorError::InvalidAmount)));
+}
+
+#[test]
+fn init_with_deadline_window_enforces_custom_window() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+
+    let custom_window = 500u64;
+    client.init_with_deadline_window(&owner, &fw, &rs, &sg, &bp, &ins, &custom_window);
+    assert_eq!(client.get_deadline_window(), custom_window);
+
+    let executor = Address::generate(&env);
+
+    // Before this fix, MAX_DEADLINE_WINDOW_SECS (3600s) was hardcoded, so a
+    // deadline 1000s out would have been accepted. With a configured 500s
+    // window it must now be rejected.
+    let too_far_deadline = env.ledger().timestamp() + 1000;
+    let hash = signed_flow_hash(&env, &executor, 10000, 0, too_far_deadline);
+    let result = client.try_execute_remittance_flow_signed(
+        &executor,
+        &10000,
+        &0u64,
+        &too_far_deadline,
+        &hash,
+        &0u64,
+    );
+    assert_eq!(result, Err(Ok(OrchestratorError::DeadlineExpired)));
+
+    // A deadline within the custom window passes the deadline check (it may
+    // still fail later for unrelated reasons, e.g. mock dependencies not
+    // implementing every entrypoint -- this only pins the deadline gate).
+    let ok_deadline = env.ledger().timestamp() + 400;
+    let hash2 = signed_flow_hash(&env, &executor, 10000, 0, ok_deadline);
+    let result2 = client.try_execute_remittance_flow_signed(
+        &executor,
+        &10000,
+        &0u64,
+        &ok_deadline,
+        &hash2,
+        &0u64,
+    );
+    assert_ne!(result2, Err(Ok(OrchestratorError::DeadlineExpired)));
+}
+
 #[test]
 fn test_rollback_savings_step_returns_cross_contract_error() {
     let (env, owner) = setup_test();
