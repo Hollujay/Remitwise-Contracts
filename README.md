@@ -15,6 +15,7 @@ This workspace contains the core smart contracts that power RemitWise's post-rem
 - **[reporting](reporting/README.md)**: Financial reporting and insights
 - **[emergency_killswitch](emergency_killswitch/README.md)**: Standalone emergency pause contract (global/module/function granularity) — not currently cross-called by the other contracts; see [docs/EMERGENCY_SHUTDOWN.md](docs/EMERGENCY_SHUTDOWN.md) for how this relates to each contract's own pause mechanism
 - **[remitwise-common](remitwise-common/README.md)**: Shared types and utilities used across contracts
+- **[docs/ERGONOMIC_HELPERS.md](docs/ERGONOMIC_HELPERS.md)**: Contributor guide to the small shared helpers used at contract boundaries
 - **[docs/PERIOD_INVARIANTS.md](docs/PERIOD_INVARIANTS.md)**: Time-bound period invariants, ledger timestamp rules, and execution windows
 - **[docs/TIMESTAMP_CONVENTIONS.md](docs/TIMESTAMP_CONVENTIONS.md)**: Rules of the road for time — how timestamps are represented, accessed, and compared across all contracts
 - **[docs/CROSS_CONTRACT_TIME.md](docs/CROSS_CONTRACT_TIME.md)**: How ledger time is shared across contracts and what it means for cross-contract flows
