@@ -740,6 +740,11 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::Unauthorized);
         }
 
+        // Harden against proposing a treasury nothing can ever accept as.
+        if new_treasury == env.current_contract_address() {
+            return Err(RemittanceSplitError::InvalidTreasuryAddress);
+        }
+
         Self::set_pending_treasury(&env, &new_treasury);
 
         env.events().publish(
