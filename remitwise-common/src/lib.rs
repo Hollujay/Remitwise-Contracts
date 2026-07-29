@@ -134,6 +134,33 @@ pub struct RoleRevokedEvent {
 pub const DEFAULT_PAGE_LIMIT: u32 = 20;
 pub const MAX_PAGE_LIMIT: u32 = 50;
 
+/// Typed error returned when a pagination limit is invalid or exceeds `MAX_PAGE_LIMIT`.
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PageLimitError {
+    /// The requested page limit exceeds `MAX_PAGE_LIMIT`.
+    LimitExceedsMax = 1,
+}
+
+/// Central guard for enforcing pagination limits against `MAX_PAGE_LIMIT`.
+///
+/// This is a defence-in-depth security guard that checks whether a caller-supplied
+/// `limit` is within the maximum allowed page size (`MAX_PAGE_LIMIT`).
+///
+/// # Arguments
+/// * `limit` - The pagination limit to validate
+///
+/// # Errors
+/// Returns [`PageLimitError::LimitExceedsMax`] if `limit > MAX_PAGE_LIMIT`.
+pub fn require_page_limit_within_bounds(limit: u32) -> Result<(), PageLimitError> {
+    if limit > MAX_PAGE_LIMIT {
+        Err(PageLimitError::LimitExceedsMax)
+    } else {
+        Ok(())
+    }
+}
+
 /// Max items returned in Top-N reports.
 pub const MAX_ITEMS_PER_REPORT: u32 = 10;
 /// Alias for MAX_ITEMS_PER_REPORT used by reporting contract.
@@ -207,6 +234,24 @@ pub const SIGNATURE_EXPIRATION: u64 = 86400;
 
 /// Contract version
 pub const CONTRACT_VERSION: u32 = 1;
+
+/// Error returned when attempting to read or process state with an outdated schema version.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum MigrationError {
+    /// The schema version is older than CONTRACT_VERSION.
+    OutdatedVersion = 1,
+}
+
+/// Verifies that a config/state version is at least `CONTRACT_VERSION`.
+pub fn verify_config_migration(version: u32) -> Result<(), MigrationError> {
+    if version < CONTRACT_VERSION {
+        Err(MigrationError::OutdatedVersion)
+    } else {
+        Ok(())
+    }
+}
 
 /// Storage key for the pause channels map
 pub const STORAGE_PAUSE_CHANNELS: &str = "PAUSE_CH";
@@ -651,6 +696,7 @@ pub fn clamp_limit(limit: u32) -> u32 {
 #[cfg(test)]
 mod rate_limiting_tests {
     use super::*;
+    use soroban_sdk::testutils::Ledger;
     use soroban_sdk::{symbol_short, testutils::Address as AddressTrait, Address, Env};
 
     #[test]
@@ -1524,7 +1570,7 @@ mod ledger_monotonicity_tests {
     //! host-level sequencing behaviour.
 
     use super::{require_ledger_seq_monotonic, LedgerError};
-    use soroban_sdk::testutils::LedgerInfo;
+    use soroban_sdk::testutils::{Ledger, LedgerInfo};
     use soroban_sdk::Env;
 
     /// Sets the ledger sequence and preserves other ledger state.
@@ -3014,7 +3060,9 @@ mod encoding_stability_tests {
 
 #[cfg(test)]
 mod stable_currency_tests {
-    use super::{require_stable_currency, require_supported_currency, StableCurrencyError};
+    use super::{
+        require_stable_currency, require_supported_currency, StableCurrencyError, STABLE_CURRENCIES,
+    };
     use soroban_sdk::{Env, Symbol};
 
     // --- Whitelisted paths: currency accepted by stable currency allowlist ---

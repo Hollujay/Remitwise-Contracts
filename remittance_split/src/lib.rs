@@ -103,6 +103,8 @@ pub enum RemittanceSplitError {
     InvalidCorridorAmountRange = 37,
     /// Two or more corridors share the same ID.
     DuplicateCorridorId = 38,
+    /// Fee rounding error.
+    FeeRounding = 39,
 }
 
 #[derive(Clone)]
