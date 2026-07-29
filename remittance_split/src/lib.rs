@@ -249,7 +249,14 @@ pub struct DistributionCompletedEvent {
     pub timestamp: u64,
 }
 
-/// Events emitted by the contract for audit trail
+/// Events emitted by the contract for audit trail.
+///
+/// `Initialized` and `Updated` only ever fire from an owner-authorized
+/// call, so they publish under the `"admin"` topic prefix, distinct from
+/// `Calculated`'s `"split"` prefix (`calculate_split` has no access
+/// control -- anyone can call it). Separating the prefixes lets a log
+/// consumer/indexer filter for privileged, config-changing activity
+/// without also matching every routine read-triggered event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SplitEvent {
@@ -1251,7 +1258,11 @@ impl RemittanceSplit {
             owner,
         );
 
-        Ok(true)
+        // Emit event for audit trail
+        env.events()
+            .publish((symbol_short!("admin"), SplitEvent::Initialized), owner);
+
+        true
     }
 
     pub fn update_split(
@@ -1312,8 +1323,11 @@ impl RemittanceSplit {
             caller.clone(),
         );
 
-        Self::increment_nonce(&env, &caller)?;
-        Ok(true)
+        // Emit event for audit trail
+        env.events()
+            .publish((symbol_short!("admin"), SplitEvent::Updated), caller);
+
+        true
     }
 
     pub fn get_split(env: &Env) -> Vec<u32> {
@@ -2565,14 +2579,52 @@ impl RemittanceSplit {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Extend the TTL of a persistent storage entry using PERSISTENT_BUMP_AMOUNT /
-    /// PERSISTENT_LIFETIME_THRESHOLD from remitwise-common.
-    fn extend_persistent_ttl<K: IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
-        env.storage().persistent().extend_ttl(
-            key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _},
+        token::{StellarAssetClient, TokenClient},
+        Env, TryFromVal,
+    };
+
+    #[test]
+    fn distribute_usdc_apportions_tokens_to_recipients() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RemittanceSplit);
+        let client = RemittanceSplitClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+        let payer = Address::generate(&env);
+        let amount = 1_000i128;
+
+        StellarAssetClient::new(&env, &token_contract.address()).mint(&payer, &amount);
+
+        let spending = Address::generate(&env);
+        let savings = Address::generate(&env);
+        let bills = Address::generate(&env);
+        let insurance = Address::generate(&env);
+
+        let accounts = AccountGroup {
+            spending: spending.clone(),
+            savings: savings.clone(),
+            bills: bills.clone(),
+            insurance: insurance.clone(),
+        };
+
+        let distributed =
+            client.distribute_usdc(&token_contract.address(), &payer, &accounts, &amount);
+
+        assert!(distributed);
+
+        let token_client = TokenClient::new(&env, &token_contract.address());
+        assert_eq!(token_client.balance(&spending), 500);
+        assert_eq!(token_client.balance(&savings), 300);
+        assert_eq!(token_client.balance(&bills), 150);
+        assert_eq!(token_client.balance(&insurance), 50);
+        assert_eq!(token_client.balance(&payer), 0);
     }
 
     /// Create a new automatic remittance schedule for the split owner.
@@ -3166,5 +3218,40 @@ impl RemittanceSplit {
             next_cursor,
             count,
         }
+    }
+
+    /// Returns the `Symbol` topic prefix (the first element of the topic
+    /// tuple) of the most recently published event.
+    fn last_event_topic_prefix(env: &Env) -> Symbol {
+        let events = env.events().all();
+        let (_, topics, _) = events.last().expect("no events were published");
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn owner_gated_events_publish_under_the_admin_topic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RemittanceSplit);
+        let client = RemittanceSplitClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        client.initialize_split(&owner, &50, &30, &15, &5);
+        assert_eq!(last_event_topic_prefix(&env), symbol_short!("admin"));
+
+        client.update_split(&owner, &40, &30, &20, &10);
+        assert_eq!(last_event_topic_prefix(&env), symbol_short!("admin"));
+    }
+
+    #[test]
+    fn calculated_event_still_publishes_under_the_split_topic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RemittanceSplit);
+        let client = RemittanceSplitClient::new(&env, &contract_id);
+
+        client.calculate_split(&1000);
+
+        assert_eq!(last_event_topic_prefix(&env), symbol_short!("split"));
     }
 }
