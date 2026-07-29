@@ -2344,15 +2344,12 @@ impl ReportingContract {
             .get(&symbol_short!("ARCH_RPT"))
             .unwrap_or_else(|| Map::new(env));
 
-        let mut active_count = 0u32;
-        for _ in reports.iter() {
-            active_count += 1;
-        }
-
-        let mut archived_count = 0u32;
-        for _ in archived.iter() {
-            archived_count += 1;
-        }
+        // `Map::iter()` deserializes every key/value pair off the host; doing
+        // that just to count entries is wasted work on every write path that
+        // calls this function. `Map::len()` reports the entry count directly
+        // without touching the values at all.
+        let active_count = reports.len();
+        let archived_count = archived.len();
 
         let stats = StorageStats {
             active_reports: active_count,
