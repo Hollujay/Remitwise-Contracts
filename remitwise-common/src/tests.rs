@@ -1484,9 +1484,10 @@ fn test_verify_slash_signature_valid() {
     let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let pk = sk.verifying_key().to_bytes();
 
-    let mut prefixed = std::vec::Vec::new();
-    prefixed.extend_from_slice(b"slash-auth");
-    prefixed.extend_from_slice(message);
+    // Must match verify_signature's length-delimited encoding (see
+    // `prefixed_message`), not a plain concatenation -- verify_slash_signature
+    // delegates to verify_signature with domain_separator = b"slash-auth".
+    let prefixed = prefixed_message(b"slash-auth", message);
     let signature = sk.sign(&prefixed).to_bytes();
 
     env.as_contract(&contract_id, || {
