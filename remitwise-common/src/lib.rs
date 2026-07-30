@@ -1935,23 +1935,15 @@ pub fn verify_signature(
 ) -> Result<(), SignatureError> {
     require_registered_verifier(env, public_key)?;
 
-    let mut prefixed_message = Bytes::new(env);
-    prefixed_message.extend_from_slice(domain_separator);
-    prefixed_message.extend_from_slice(message);
-
-    let sig_bytes: BytesN<64> = {
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(signature);
-        BytesN::from_array(env, &arr)
-    };
-    let pk_bytes: BytesN<32> = {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(public_key);
-        BytesN::from_array(env, &arr)
-    };
-
-    env.crypto()
-        .ed25519_verify(&pk_bytes, &prefixed_message, &sig_bytes);
+    // Note: this used to also run a first, redundant `ed25519_verify` pass
+    // against a plain (non-length-prefixed) concatenation of
+    // domain_separator + message, built with unchecked `copy_from_slice`
+    // (which panics instead of returning InvalidSignatureLength /
+    // InvalidPublicKeyLength for a wrong-length input). It verified a
+    // different, ambiguous encoding that no real caller signs against, so it
+    // did nothing but double the ed25519_verify cost of every call -- and
+    // broke callers whose signature/public_key had a bad length, since the
+    // panic pre-empted the length-checked error path below.
     let pk_arr: [u8; 32] = public_key
         .try_into()
         .map_err(|_| SignatureError::InvalidPublicKeyLength)?;
