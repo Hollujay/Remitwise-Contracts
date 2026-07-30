@@ -110,6 +110,8 @@ pub enum RemittanceSplitError {
     BatchLengthMismatch = 40,
     /// `batch_transfer`'s recipient count exceeds `remitwise_common::MAX_BATCH_SIZE`.
     BatchSizeExceeded = 41,
+    /// A `set_min_deposit` value is below `params::MIN_CORRIDOR_AMOUNT`.
+    InvalidMinDeposit = 42,
 }
 
 #[derive(Clone)]
@@ -1489,10 +1491,64 @@ impl RemittanceSplit {
 
     /// Return the minimum amount accepted for a remittance deposit.
     ///
-    /// The value is shared with corridor validation so callers can discover
-    /// the active lower bound without duplicating contract configuration.
-    pub fn min_deposit(_env: Env) -> i128 {
-        params::MIN_CORRIDOR_AMOUNT
+    /// Returns the owner-configured value set via [`set_min_deposit`], or
+    /// [`params::MIN_CORRIDOR_AMOUNT`] if none has been set. Shared with
+    /// corridor validation so callers can discover the active lower bound
+    /// without duplicating contract configuration.
+    pub fn min_deposit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("MINDEP"))
+            .unwrap_or(params::MIN_CORRIDOR_AMOUNT)
+    }
+
+    /// Configure the minimum accepted deposit amount, overriding the
+    /// [`params::MIN_CORRIDOR_AMOUNT`] default returned by [`min_deposit`].
+    ///
+    /// Only the contract owner may call this. `value` must be at least
+    /// [`params::MIN_CORRIDOR_AMOUNT`] -- the protocol-wide floor is not
+    /// lowerable, only raisable, to prevent a compromised owner key from
+    /// reopening a previously-closed dust-amount griefing vector.
+    ///
+    /// # Errors
+    /// - `NotInitialized` if `initialize_split` has not been called
+    /// - `Unauthorized`   if `caller` is not the owner
+    /// - `InvalidNonce`   if `nonce` does not match the caller's expected nonce
+    /// - `InvalidMinDeposit` if `value` < `params::MIN_CORRIDOR_AMOUNT`
+    pub fn set_min_deposit(
+        env: Env,
+        caller: Address,
+        nonce: u64,
+        value: i128,
+    ) -> Result<(), RemittanceSplitError> {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
+        Self::require_nonce(&env, &caller, nonce)?;
+
+        let config: SplitConfig = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("CONFIG"))
+            .ok_or(RemittanceSplitError::NotInitialized)?;
+
+        if config.owner != caller {
+            Self::append_audit(&env, symbol_short!("min_dep"), &caller, false);
+            return Err(RemittanceSplitError::Unauthorized);
+        }
+
+        if value < params::MIN_CORRIDOR_AMOUNT {
+            return Err(RemittanceSplitError::InvalidMinDeposit);
+        }
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("MINDEP"), &value);
+
+        Self::increment_nonce(&env, &caller)?;
+        Self::append_audit(&env, symbol_short!("min_dep"), &caller, true);
+
+        Ok(())
     }
 
     pub fn calculate_split(
