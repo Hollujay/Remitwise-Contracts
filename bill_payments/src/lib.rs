@@ -323,6 +323,10 @@ pub enum BillPaymentsError {
     /// upgrade admin — rejected so a mistyped no-op rotation is caught at the
     /// call site instead of silently doing nothing.
     SameAdmin = 33,
+    /// `init_admin` was called with a `rotation_timelock_seconds` below
+    /// `MIN_SCHEDULE_INTERVAL` — too short to serve its purpose of giving the
+    /// legitimate admin a window to notice and react to a rotation proposal.
+    RotationTimelockTooShort = 34,
 }
 
 pub type Error = BillPaymentsError;
@@ -409,7 +413,9 @@ pub struct PreUpgradeSnapshot {
     pub pause_admin: Option<Address>,
 }
 
-/// Seconds an admin rotation must sit proposed before it can be finalized.
+/// Sane default for the admin-rotation timelock, used when a deployment
+/// doesn't have its own opinion. See [`Self::init_admin`] to configure a
+/// different window per deployment.
 ///
 /// ## Why a timelock
 ///
@@ -423,7 +429,7 @@ pub struct PreUpgradeSnapshot {
 /// watching `AdminEvent::RotationProposed`) time to notice the proposal
 /// and respond, rather than a single signature being an irreversible,
 /// instant takeover.
-const ADMIN_ROTATION_TIMELOCK_SECONDS: u64 = 2 * 86400; // 2 days
+pub const DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS: u64 = 2 * 86400; // 2 days
 
 /// A rotation that has been proposed but not yet finalized.
 #[derive(Clone, Debug, PartialEq)]
@@ -3561,26 +3567,57 @@ impl BillPayments {
 
     /// One-time admin setup.
     ///
+    /// `rotation_timelock_seconds` configures how long a future admin
+    /// rotation must sit proposed before `finalize_admin_rotation` can
+    /// complete it -- see [`DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS`] for the
+    /// sane default and the rationale. Pass that constant to keep the
+    /// previous fixed behavior, or a different value to tune it per
+    /// deployment (e.g. a short window on a test network).
+    ///
     /// # Errors
     /// * `AdminAlreadyInitialized` - If an admin has already been set
-    pub fn init_admin(env: Env, admin: Address) -> Result<(), Error> {
+    /// * `RotationTimelockTooShort` - If `rotation_timelock_seconds` is
+    ///   below `MIN_SCHEDULE_INTERVAL`
+    pub fn init_admin(
+        env: Env,
+        admin: Address,
+        rotation_timelock_seconds: u64,
+    ) -> Result<(), Error> {
         admin.require_auth();
 
         if env.storage().instance().has(&symbol_short!("ADMIN")) {
             return Err(Error::AdminAlreadyInitialized);
         }
 
+        if rotation_timelock_seconds < MIN_SCHEDULE_INTERVAL {
+            return Err(Error::RotationTimelockTooShort);
+        }
+
         env.storage()
             .instance()
             .set(&symbol_short!("ADMIN"), &admin);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("ROT_TL"), &rotation_timelock_seconds);
         env.events()
             .publish((symbol_short!("admin"), AdminEvent::Initialized), admin);
 
         Ok(())
     }
 
+    /// Get the configured admin-rotation timelock window, in seconds.
+    /// Returns [`DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS`] if `init_admin`
+    /// hasn't run yet.
+    pub fn get_admin_rotation_timelock(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("ROT_TL"))
+            .unwrap_or(DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS)
+    }
+
     /// Propose rotating the admin to `new_admin`. Does not take effect
-    /// immediately -- see `ADMIN_ROTATION_TIMELOCK_SECONDS`. Call
+    /// immediately -- uses the timelock window configured at `init_admin`
+    /// (see [`Self::get_admin_rotation_timelock`]). Call
     /// `finalize_admin_rotation` after the timelock elapses to complete it.
     /// A second call before finalization overwrites the still-pending
     /// proposal (and restarts its timelock) rather than stacking.
@@ -3605,7 +3642,12 @@ impl BillPayments {
             return Err(Error::Unauthorized);
         }
 
-        let executable_at = env.ledger().timestamp() + ADMIN_ROTATION_TIMELOCK_SECONDS;
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ROT_TL"))
+            .unwrap_or(DEFAULT_ADMIN_ROTATION_TIMELOCK_SECONDS);
+        let executable_at = env.ledger().timestamp() + timelock;
         let pending = PendingAdminRotation {
             new_admin: new_admin.clone(),
             executable_at,
