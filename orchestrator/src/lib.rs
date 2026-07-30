@@ -1472,11 +1472,25 @@ impl Orchestrator {
 
         Self::require_nonce(env, address, nonce)?;
 
-        if request_hash != expected_hash {
+        if !Self::constant_time_eq(request_hash, expected_hash) {
             return Err(OrchestratorError::InvalidNonce);
         }
 
         Ok(())
+    }
+
+    /// Constant-time equality check for the request-hash binding above.
+    ///
+    /// Plain `!=` on primitives is not guaranteed to be constant-time --
+    /// depending on target and optimization level, integer comparison can be
+    /// lowered in ways whose timing varies with where the values first
+    /// differ. XOR-then-compare-to-zero never branches on the operands
+    /// themselves: every input pair takes the same path regardless of
+    /// whether (or where) `a` and `b` differ, which is what we want when
+    /// comparing a caller-supplied value against a secret-derived binding
+    /// hash.
+    fn constant_time_eq(a: u64, b: u64) -> bool {
+        (a ^ b) == 0
     }
 
     /// Guard that rejects calls while any operation is in progress.
