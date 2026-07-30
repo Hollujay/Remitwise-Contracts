@@ -422,6 +422,56 @@ fn test_checked_empty_batch_before_length_check() {
     assert_eq!(err, TagError::Empty);
 }
 
+// ─── canonicalize_tag_checked: single-tag entry point ────────────────────────
+//
+// Issue #1593: single-tag lookups (e.g. a tag-index query keyed on one
+// caller-supplied tag) previously had to wrap that tag in a one-element `Vec`
+// just to call the batch `canonicalize_tags_checked` API, which then
+// allocated a second `Vec` for its output. `canonicalize_tag_checked` does
+// the identical validation/lowercasing with no `Vec` involved at all, and
+// `canonicalize_tags_checked` is now defined in terms of it.
+
+#[test]
+fn test_single_canonicalize_lowercases_and_matches_batch() {
+    let env = Env::default();
+    let single_result = canonicalize_tag_checked(&env, &String::from_str(&env, "MyGoal")).unwrap();
+    let batch_result = canonicalize_tags_checked(&env, &single(&env, "MyGoal")).unwrap();
+
+    let mut wrapped = Vec::new(&env);
+    wrapped.push_back(single_result.clone());
+    assert_eq!(get(&env, &wrapped, 0), "mygoal");
+    assert_eq!(batch_result.get(0).unwrap(), single_result);
+}
+
+#[test]
+fn test_single_canonicalize_rejects_empty() {
+    let env = Env::default();
+    assert_eq!(
+        canonicalize_tag_checked(&env, &String::from_str(&env, "")),
+        Err(TagError::Empty)
+    );
+}
+
+#[test]
+fn test_single_canonicalize_rejects_too_long() {
+    let env = Env::default();
+    let tag = "a".repeat(33);
+    let tag = std::string::String::from_utf8(tag.into_bytes()).unwrap();
+    assert_eq!(
+        canonicalize_tag_checked(&env, &String::from_str(&env, &tag)),
+        Err(TagError::TooLong)
+    );
+}
+
+#[test]
+fn test_single_canonicalize_rejects_invalid_char() {
+    let env = Env::default();
+    assert_eq!(
+        canonicalize_tag_checked(&env, &String::from_str(&env, "#savings")),
+        Err(TagError::InvalidChar { position: 0 })
+    );
+}
+
 // ─── canonicalise_symbol ──────────────────────────────────────────────────────
 
 /// A deterministic helper: get string content from a Symbol for assertions.
@@ -1484,9 +1534,10 @@ fn test_verify_slash_signature_valid() {
     let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let pk = sk.verifying_key().to_bytes();
 
-    let mut prefixed = std::vec::Vec::new();
-    prefixed.extend_from_slice(b"slash-auth");
-    prefixed.extend_from_slice(message);
+    // Must match verify_signature's length-delimited encoding (see
+    // `prefixed_message`), not a plain concatenation -- verify_slash_signature
+    // delegates to verify_signature with domain_separator = b"slash-auth".
+    let prefixed = prefixed_message(b"slash-auth", message);
     let signature = sk.sign(&prefixed).to_bytes();
 
     env.as_contract(&contract_id, || {
@@ -3005,5 +3056,39 @@ mod investigation_epoch_guard_comprehensive_tests {
             !is_investigation_epoch_active(&env),
             "saturated epoch_end == timestamp must not be considered active"
         );
+    }
+}
+
+mod require_future_timestamp_tests {
+    use super::*;
+
+    fn env_at(timestamp: u64) -> Env {
+        let env = Env::default();
+        env.ledger().with_mut(|li| li.timestamp = timestamp);
+        env
+    }
+
+    #[test]
+    fn rejects_timestamp_equal_to_now() {
+        let env = env_at(1_000);
+        assert_eq!(
+            require_future_timestamp(&env, 1_000),
+            Err(TimestampError::NotInFuture)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_before_now() {
+        let env = env_at(1_000);
+        assert_eq!(
+            require_future_timestamp(&env, 999),
+            Err(TimestampError::NotInFuture)
+        );
+    }
+
+    #[test]
+    fn accepts_timestamp_after_now() {
+        let env = env_at(1_000);
+        assert_eq!(require_future_timestamp(&env, 1_001), Ok(()));
     }
 }

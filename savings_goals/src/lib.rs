@@ -1753,13 +1753,17 @@ impl SavingsGoalContract {
     ) -> GoalPage {
         let limit = Self::clamp_limit(limit);
 
-        // Canonicalize the tag for lookup
-        let mut tags_vec = Vec::new(&env);
-        tags_vec.push_back(tag.clone());
-        let normalized = Self::validate_and_normalize_tags(&env, &tags_vec);
-        let canonical_tag = normalized
-            .get(0)
-            .unwrap_or_else(|| panic!("Tag normalization failed"));
+        // Canonicalize the single lookup tag directly -- no need to wrap it
+        // in a one-element Vec just to call the batch normalizer.
+        let canonical_tag = match remitwise_common::canonicalize_tag_checked(&env, &tag) {
+            Ok(t) => t,
+            Err(remitwise_common::TagError::Empty) | Err(remitwise_common::TagError::TooLong) => {
+                panic!("Tag must be between 1 and 32 characters")
+            }
+            Err(remitwise_common::TagError::InvalidChar { .. }) => {
+                soroban_sdk::panic_with_error!(&env, SavingsGoalError::InvalidTagContent)
+            }
+        };
 
         let ids: Vec<u32> = env
             .storage()
@@ -2817,6 +2821,14 @@ impl SavingsGoalContract {
     ///   re-enables execution for the updated due date.
     pub fn execute_due_savings_schedules(env: Env) -> Vec<u32> {
         if remitwise_common::require_no_active_kill_switch(&env).is_err() {
+            return Vec::new(&env);
+        }
+        // This entrypoint is permissionless (anyone may call it to advance due
+        // schedules), so it must independently respect the contract's own
+        // pause flag rather than relying only on the separate global kill
+        // switch checked above -- otherwise `pause()` would have no effect on
+        // scheduled fund movement while every other write path stays blocked.
+        if Self::get_global_paused(&env) {
             return Vec::new(&env);
         }
         Self::extend_instance_ttl(&env);

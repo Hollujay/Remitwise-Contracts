@@ -22,6 +22,7 @@ enum DataKey {
     Admin,
     GlobalPaused,
     PausedSince,
+    PauseReason,
     ModulePaused(Symbol),
     PausedFunctions(Symbol),
     UnpauseSchedule,
@@ -29,6 +30,10 @@ enum DataKey {
 }
 
 pub const MAX_PAUSED_FUNCTIONS: u32 = 10;
+
+/// Contract version, bumped on every on-chain-upgrade-relevant change so
+/// callers/tooling can detect which build of the WASM they are talking to.
+pub const CONTRACT_VERSION: u32 = 1;
 
 /// Emitted when the killswitch admin is successfully transferred.
 #[contracttype]
@@ -134,6 +139,15 @@ impl EmergencyKillswitch {
         Ok(new_epoch)
     }
 
+    /// Returns [`CONTRACT_VERSION`], the version of this deployed WASM build.
+    ///
+    /// Intended for off-chain tooling/upgrade scripts to confirm which
+    /// contract version they are interacting with before/after an upgrade.
+    /// No authentication required — the version is observable on-chain.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
+    }
+
     /// Return the current kill-switch epoch.
     ///
     /// No authentication required — the epoch is observable on-chain.
@@ -183,28 +197,49 @@ impl EmergencyKillswitch {
     }
 
     pub fn pause(env: Env) -> Result<(), Error> {
+        Self::pause_internal(env, None)
+    }
+
+    /// Same as [`pause`], but records `reason` for later retrieval via
+    /// [`pause_reason`]. Additive alternative kept separate from `pause` so
+    /// existing callers/signatures are unaffected.
+    pub fn pause_with_reason(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::pause_internal(env, Some(reason))
+    }
+
+    fn pause_internal(env: Env, reason: Option<Symbol>) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
+        let now = env.ledger().timestamp();
         env.storage().instance().set(&DataKey::GlobalPaused, &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::PausedSince, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::PausedSince, &now);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
+        match &reason {
+            Some(r) => env.storage().instance().set(&DataKey::PauseReason, r),
+            None => env.storage().instance().remove(&DataKey::PauseReason),
+        }
         env.events().publish(
             (
                 symbol_short!("emergency"),
                 soroban_sdk::Symbol::new(&env, remitwise_common::events::ACTION_PAUSED_V2),
             ),
             remitwise_common::events::PauseEvent {
-                paused_at: env.ledger().timestamp(),
+                paused_at: now,
                 paused_by: admin.clone(),
             },
         );
         Ok(())
+    }
+
+    /// Returns the reason recorded by [`pause_with_reason`], or `None` if the
+    /// contract is not paused or was paused via plain [`pause`] with no reason.
+    /// Cleared on `unpause` and `clear_emergency_state`.
+    pub fn pause_reason(env: Env) -> Option<Symbol> {
+        env.storage().instance().get(&DataKey::PauseReason)
     }
 
     pub fn unpause(env: Env) -> Result<(), Error> {
@@ -219,11 +254,13 @@ impl EmergencyKillswitch {
             .instance()
             .get(&DataKey::UnpauseSchedule)
             .ok_or(Error::InvalidSchedule)?;
-        if env.ledger().timestamp() < schedule {
+        let now = env.ledger().timestamp();
+        if now < schedule {
             return Err(Error::Unauthorized);
         }
         env.storage().instance().set(&DataKey::GlobalPaused, &false);
         env.storage().instance().remove(&DataKey::PausedSince);
+        env.storage().instance().remove(&DataKey::PauseReason);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
         env.events().publish(
             (
@@ -231,7 +268,7 @@ impl EmergencyKillswitch {
                 soroban_sdk::Symbol::new(&env, remitwise_common::events::ACTION_UNPAUSED_V2),
             ),
             remitwise_common::events::UnpauseEvent {
-                unpaused_at: env.ledger().timestamp(),
+                unpaused_at: now,
                 unpaused_by: admin.clone(),
             },
         );
@@ -265,6 +302,7 @@ impl EmergencyKillswitch {
         admin.require_auth();
         env.storage().instance().set(&DataKey::GlobalPaused, &false);
         env.storage().instance().remove(&DataKey::PausedSince);
+        env.storage().instance().remove(&DataKey::PauseReason);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
         env.events().publish(
             (

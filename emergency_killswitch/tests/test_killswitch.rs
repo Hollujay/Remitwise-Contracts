@@ -15,6 +15,14 @@ fn setup(env: &Env) -> (Address, EmergencyKillswitchClient<'_>) {
 }
 
 #[test]
+fn version_returns_contract_version_without_init() {
+    let env = Env::default();
+    let (_, client) = setup(&env);
+    // Observable on-chain with no auth and before initialize().
+    assert_eq!(client.version(), emergency_killswitch::CONTRACT_VERSION);
+}
+
+#[test]
 fn initialize_rejects_self_address() {
     let env = Env::default();
     env.mock_all_auths();
@@ -618,4 +626,60 @@ fn is_module_paused_does_not_affect_function_list() {
     client.pause_module(&module);
     // Module being paused doesn't populate PausedFunctions
     assert!(client.list_paused_functions(&module).is_empty());
+}
+
+#[test]
+fn pause_reason_none_before_any_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.pause_reason(), None);
+}
+
+#[test]
+fn pause_reason_none_when_paused_without_reason() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    client.pause();
+    assert!(client.is_paused());
+    assert_eq!(client.pause_reason(), None);
+}
+
+#[test]
+fn pause_reason_set_by_pause_with_reason_and_cleared_on_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let reason = symbol_short!("exploit");
+    client.pause_with_reason(&reason);
+    assert!(client.is_paused());
+    assert_eq!(client.pause_reason(), Some(reason));
+
+    env.ledger().with_mut(|l| l.timestamp += 1);
+    client.schedule_unpause(&env.ledger().timestamp());
+    env.ledger().with_mut(|l| l.timestamp += 1);
+    client.unpause();
+    assert_eq!(client.pause_reason(), None);
+}
+
+#[test]
+fn pause_reason_cleared_by_clear_emergency_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.pause_with_reason(&symbol_short!("exploit"));
+    client.clear_emergency_state();
+    assert!(!client.is_paused());
+    assert_eq!(client.pause_reason(), None);
 }
