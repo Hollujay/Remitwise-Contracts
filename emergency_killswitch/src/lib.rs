@@ -22,6 +22,7 @@ enum DataKey {
     Admin,
     GlobalPaused,
     PausedSince,
+    PauseReason,
     ModulePaused(Symbol),
     PausedFunctions(Symbol),
     UnpauseSchedule,
@@ -196,6 +197,17 @@ impl EmergencyKillswitch {
     }
 
     pub fn pause(env: Env) -> Result<(), Error> {
+        Self::pause_internal(env, None)
+    }
+
+    /// Same as [`pause`], but records `reason` for later retrieval via
+    /// [`pause_reason`]. Additive alternative kept separate from `pause` so
+    /// existing callers/signatures are unaffected.
+    pub fn pause_with_reason(env: Env, reason: Symbol) -> Result<(), Error> {
+        Self::pause_internal(env, Some(reason))
+    }
+
+    fn pause_internal(env: Env, reason: Option<Symbol>) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
@@ -206,6 +218,10 @@ impl EmergencyKillswitch {
         env.storage().instance().set(&DataKey::GlobalPaused, &true);
         env.storage().instance().set(&DataKey::PausedSince, &now);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
+        match &reason {
+            Some(r) => env.storage().instance().set(&DataKey::PauseReason, r),
+            None => env.storage().instance().remove(&DataKey::PauseReason),
+        }
         env.events().publish(
             (
                 symbol_short!("emergency"),
@@ -217,6 +233,13 @@ impl EmergencyKillswitch {
             },
         );
         Ok(())
+    }
+
+    /// Returns the reason recorded by [`pause_with_reason`], or `None` if the
+    /// contract is not paused or was paused via plain [`pause`] with no reason.
+    /// Cleared on `unpause` and `clear_emergency_state`.
+    pub fn pause_reason(env: Env) -> Option<Symbol> {
+        env.storage().instance().get(&DataKey::PauseReason)
     }
 
     pub fn unpause(env: Env) -> Result<(), Error> {
@@ -237,6 +260,7 @@ impl EmergencyKillswitch {
         }
         env.storage().instance().set(&DataKey::GlobalPaused, &false);
         env.storage().instance().remove(&DataKey::PausedSince);
+        env.storage().instance().remove(&DataKey::PauseReason);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
         env.events().publish(
             (
@@ -278,6 +302,7 @@ impl EmergencyKillswitch {
         admin.require_auth();
         env.storage().instance().set(&DataKey::GlobalPaused, &false);
         env.storage().instance().remove(&DataKey::PausedSince);
+        env.storage().instance().remove(&DataKey::PauseReason);
         env.storage().instance().remove(&DataKey::UnpauseSchedule);
         env.events().publish(
             (
