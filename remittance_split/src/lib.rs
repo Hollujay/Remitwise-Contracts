@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod events_schema_test;
 mod params;
+pub use params::*;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -11,21 +12,13 @@ mod tests_safe_math;
 
 use remitwise_common::{
     clamp_limit, guard_bytes_len, verify_no_dust, EventCategory, EventPriority, RemitwiseEvents,
-    Timestamp, ToI128Checked, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE,
-    PERSISTENT_BUMP_AMOUNT, PERSISTENT_LIFETIME_THRESHOLD, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+    Timestamp, ToI128Checked,
 };
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
     Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
-
-// Event topics
-const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
-const SPLIT_CALCULATED: Symbol = symbol_short!("calc");
-
-// Request hash domain separator for signing (prevents cross-domain attacks)
-const DISTRIBUTE_USDC_DOMAIN: &[u8] = b"distribute_usdc_v1";
 
 mod fee_math;
 
@@ -181,19 +174,6 @@ pub struct DistributeUsdcRequest {
     /// Deadline timestamp (Unix seconds) - request is invalid after this time
     pub deadline: u64,
 }
-
-/// Maximum number of used nonces tracked per address before the oldest are pruned.
-const MAX_USED_NONCES_PER_ADDR: u32 = 256;
-/// Maximum number of remittance schedules allowed per owner to prevent storage bloat.
-pub const MAX_SCHEDULES_PER_OWNER: u32 = 50;
-/// Minimum allowed recurrence interval for repeating schedules (1 hour in seconds).
-/// One-off schedules (interval == 0) are exempt from this check.
-pub const MIN_SCHEDULE_INTERVAL: u64 = 3_600;
-/// Maximum allowed lead time for schedule due dates (1 year in seconds).
-/// Prevents unrealistic far-future scheduling that creates operational risk.
-pub const MAX_SCHEDULE_LEAD_TIME: u64 = 365 * 24 * 3_600;
-/// Maximum allowed window for transaction deadlines (1 hour).
-pub const MAX_DEADLINE_WINDOW_SECS: u64 = 3_600;
 
 /// Split configuration with owner tracking for access control.
 ///
@@ -390,11 +370,6 @@ pub enum ScheduleEvent {
 // signer commits to the exact configuration being applied.
 // NOTE: `SplitAuthPayload` is defined below with a stable schema.
 
-/// Current snapshot schema version. Bumped to 2 for FNV-1a checksum + exported_at field.
-const SCHEMA_VERSION: u32 = 2;
-/// Oldest snapshot schema version this contract can import. Enables backward compat.
-const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
-
 /// Domain-separated payload for split initialization.
 /// Binds technical context (network, contract) with business parameters
 /// to prevent relay/replay attacks across different deployments or networks.
@@ -422,9 +397,6 @@ pub struct SplitAuthPayload {
     /// Percentage for insurance premiums
     pub insurance_percent: u32,
 }
-
-const MAX_AUDIT_ENTRIES: u32 = 100;
-const CONTRACT_VERSION: u32 = 1;
 
 #[contracttype]
 pub enum DataKey {
@@ -2783,7 +2755,6 @@ impl RemittanceSplit {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
- validate/rotate-admin-same-address
 }
 
 #[cfg(test)]
@@ -2833,9 +2804,9 @@ mod tests {
         assert_eq!(token_client.balance(&insurance), 50);
         assert_eq!(token_client.balance(&payer), 0);
     }
+}
 
-=======
- main
+impl RemittanceSplit {
     /// Create a new automatic remittance schedule for the split owner.
     ///
     /// # Arguments
