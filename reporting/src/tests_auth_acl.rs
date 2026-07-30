@@ -412,6 +412,24 @@ fn test_admin_rotation_non_admin_cannot_propose() {
     );
 }
 
+/// Administrative maintenance entrypoints must reject an authenticated
+/// caller who is not the configured admin, even when the operation is empty.
+#[test]
+fn test_report_maintenance_requires_configured_admin() {
+    let env = create_test_env();
+    let (client, _admin) = setup_reporting(&env);
+    let attacker = Address::generate(&env);
+
+    assert_eq!(
+        client.try_archive_old_reports(&attacker, &0u64),
+        Err(Ok(ReportingError::Unauthorized)),
+    );
+    assert_eq!(
+        client.try_cleanup_old_reports(&attacker, &0u64),
+        Err(Ok(ReportingError::Unauthorized)),
+    );
+}
+
 /// Requirement 2: only the proposed address may call `accept_admin_rotation`.
 /// Any other caller (including the current admin) is rejected, and the rotation
 /// only completes when the genuinely proposed address accepts.
