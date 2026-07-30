@@ -1493,10 +1493,10 @@ fn test_unsigned_rollback_first_step_fails_no_compensation() {
     assert!(!client.get_execution_state(), "Lock must be released");
 }
 
-/// Test that the fan-out flow (`execute_flow_fanout`) does NOT compensate
-/// on failure — it returns per-step success/failure but does not roll back
-/// previously-applied steps. This verifies the compensation flag is false
-/// for fan-out calls.
+/// Test that the fan-out flow (`execute_flow_fanout`) returns
+/// `CrossContractCallFailed` (not `RemittanceFlowRolledBack`) when a
+/// downstream step fails — verification that compensation is NOT applied
+/// on the fan-out path (unlike the atomic flow which compensates).
 #[test]
 fn test_fanout_flow_does_not_compensate_on_bill_failure() {
     let env = Env::default();
@@ -1505,24 +1505,40 @@ fn test_fanout_flow_does_not_compensate_on_bill_failure() {
     let orchestrator_id = env.register_contract(None, Orchestrator);
     let client = OrchestratorClient::new(&env, &orchestrator_id);
 
-    // Register separate mocks so each dependency has its own contract ID.
-    // Fanout reads from storage so we must init the orchestrator first.
+    // Use the bill-failing mock with compensation support; fan-out should
+    // return CrossContractCallFailed rather than attempting rollback.
     let owner = Address::generate(&env);
     let fw = env.register_contract(None, MockContract);
     let rs = env.register_contract(None, MockContract);
     let sg = env.register_contract(None, MockContract);
-    let bp = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, mock_unsigned_fail_bill::Contract);
     let ins = env.register_contract(None, MockContract);
     client.init(&owner, &fw, &rs, &sg, &bp, &ins);
 
     let caller = Address::generate(&env);
 
-    // First ensure the fan-out succeeds with happy mocks
-    let happy = client.try_execute_flow_fanout(&caller, &10000i128);
-    assert!(happy.is_ok(), "fan-out with happy mocks must succeed");
-    if let Ok(Ok(result)) = &happy {
-        assert!(result.all_succeeded, "all steps must succeed with happy mocks");
+    // Fan-out with failing bill step: must NOT compensate (no rollback)
+    let result = client.try_execute_flow_fanout(&caller, &10000i128);
+
+    // The fan-out captures per-step results — the outer Result should be Ok,
+    // but the inner FanOutFlowResult.all_succeeded should be false.
+    assert!(result.is_ok(), "fan-out must not panic on step failure");
+    if let Ok(Ok(fanout)) = &result {
+        assert!(!fanout.all_succeeded, "fan-out must report all_succeeded=false when a step fails");
+        assert!(!fanout.savings.succeeded, "savings step must report failure when bill mock panics");
+        assert!(!fanout.bills.succeeded, "bill step must report failure");
+    } else if let Ok(Err(e)) = &result {
+        // If the fan-out returns an error, it must be CrossContractCallFailed,
+        // NOT RemittanceFlowRolledBack (which would indicate compensation).
+        assert_eq!(
+            *e,
+            OrchestratorError::CrossContractCallFailed,
+            "fan-out failure must be CrossContractCallFailed, not RemittanceFlowRolledBack"
+        );
     }
+
+    // Lock must be released even on fan-out failure
+    assert!(!client.get_execution_state(), "Lock must be released after fan-out failure");
 }
 
 // ---------------------------------------------------------------------------
