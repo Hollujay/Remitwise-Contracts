@@ -408,6 +408,62 @@ impl Orchestrator {
         bill_payments: Address,
         insurance: Address,
     ) -> Result<bool, OrchestratorError> {
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            None,
+        )
+    }
+
+    /// Same as [`init`], but also configures the signed-flow deadline window
+    /// (see `require_nonce_hardened`) instead of relying on the
+    /// `MAX_DEADLINE_WINDOW_SECS` default. Kept as a separate entrypoint so
+    /// `init`'s signature and existing callers are unaffected.
+    ///
+    /// # Errors
+    /// - `InvalidAmount` if `deadline_window_secs == 0` -- a zero window
+    ///   would make every signed flow deadline immediately expired.
+    pub fn init_with_deadline_window(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: u64,
+    ) -> Result<bool, OrchestratorError> {
+        if deadline_window_secs == 0 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            Some(deadline_window_secs),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init_internal(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: Option<u64>,
+    ) -> Result<bool, OrchestratorError> {
         caller.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
@@ -466,6 +522,11 @@ impl Orchestrator {
         env.storage()
             .instance()
             .set(&symbol_short!("NONCES"), &Map::<Address, u64>::new(&env));
+        if let Some(window) = deadline_window_secs {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("DL_WIN"), &window);
+        }
 
         // Store default execution parameters for the signed flow.
         // These can be updated by the owner via a future admin method.
@@ -708,6 +769,18 @@ impl Orchestrator {
     /// in basis points (1% = 100 basis points).
     ///
     /// This is a read-only view function that does not require authorization.
+    /// Returns the configured signed-flow deadline window in seconds -- the
+    /// maximum distance into the future a caller-supplied deadline may sit
+    /// (see `require_nonce_hardened`). Falls back to `MAX_DEADLINE_WINDOW_SECS`
+    /// if `init_with_deadline_window` was never called (i.e. plain `init` was
+    /// used). No authentication required — observable on-chain.
+    pub fn get_deadline_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("DL_WIN"))
+            .unwrap_or(MAX_DEADLINE_WINDOW_SECS)
+    }
+
     pub fn get_fee_schedule(env: Env) -> Option<(u32, u32, u32, u32)> {
         let rs_addr: Address = env.storage().instance().get(&symbol_short!("RS_ADDR"))?;
 
@@ -1462,7 +1535,7 @@ impl Orchestrator {
         if deadline <= now {
             return Err(OrchestratorError::DeadlineExpired);
         }
-        if deadline > now + MAX_DEADLINE_WINDOW_SECS {
+        if deadline > now + Self::get_deadline_window(env.clone()) {
             return Err(OrchestratorError::DeadlineExpired);
         }
 
