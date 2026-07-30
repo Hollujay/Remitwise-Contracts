@@ -1323,6 +1323,224 @@ fn test_signed_deadline_rejected_does_not_mutate_stats() {
     );
 }
 
+// ============================================================================
+// Issue #1539: Additional rollback on inner call failure tests
+//
+// These tests supplement the existing rollback coverage by exercising:
+//  - The unsigned `execute_remittance_flow` path (the existing tests use
+//    the signed `execute_remittance_flow_signed` path)
+//  - Rollback behaviour with dedicated mocks that implement both forward
+//    step methods AND compensation (reverse) interfaces, so the
+//    best-effort compensation actually succeeds
+//  - Fan-out flow (`execute_flow_fanout`) which does NOT compensate —
+//    verifying compensation is only applied on the atomic flow path
+// ---------------------------------------------------------------------------
+
+/// Failing bill mock with compensation support for unsigned flow.
+/// Forward steps succeed except pay_bill; reverse methods succeed.
+mod mock_unsigned_fail_bill {
+    use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
+
+    #[contract]
+    pub struct Contract;
+
+    #[contractimpl]
+    impl Contract {
+        pub fn check_spending_limit(_env: Env, _user: Address, _amount: i128) -> bool { true }
+        pub fn calculate_split(env: Env, _total_amount: i128) -> Vec<i128> {
+            soroban_sdk::vec![&env, 2500i128, 2500i128, 2500i128, 2500i128]
+        }
+        pub fn add_to_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn pay_bill(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {
+            panic!("bill step failed")
+        }
+        pub fn pay_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {}
+        // Compensation methods (reverse interfaces)
+        pub fn remove_from_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn reverse_payment(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {}
+        pub fn reverse_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {}
+    }
+}
+
+/// Failing insurance mock with compensation support for unsigned flow.
+mod mock_unsigned_fail_insurance {
+    use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
+
+    #[contract]
+    pub struct Contract;
+
+    #[contractimpl]
+    impl Contract {
+        pub fn check_spending_limit(_env: Env, _user: Address, _amount: i128) -> bool { true }
+        pub fn calculate_split(env: Env, _total_amount: i128) -> Vec<i128> {
+            soroban_sdk::vec![&env, 2500i128, 2500i128, 2500i128, 2500i128]
+        }
+        pub fn add_to_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn pay_bill(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {}
+        pub fn pay_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {
+            panic!("insurance step failed")
+        }
+        // Compensation methods
+        pub fn remove_from_goal(_env: Env, _user: Address, _goal_id: u32, _amount: i128) {}
+        pub fn reverse_payment(_env: Env, _user: Address, _bill_id: u32, _amount: i128) {}
+        pub fn reverse_premium(_env: Env, _user: Address, _policy_id: u32, _amount: i128) {}
+    }
+}
+
+/// Test that the unsigned `execute_remittance_flow` returns
+/// `RemittanceFlowRolledBack` when a downstream bill step fails after
+/// savings succeeded. This mirrors the signed-path test but covers the
+/// unsigned entry point (which uses `execute_remittance_flow` directly).
+#[test]
+fn test_unsigned_rollback_bill_failure_returns_rolled_back() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let orchestrator_id = env.register_contract(None, Orchestrator);
+    let client = OrchestratorClient::new(&env, &orchestrator_id);
+
+    let mock_id = env.register_contract(None, mock_unsigned_fail_bill::Contract);
+    let caller = Address::generate(&env);
+
+    let result = client.try_execute_remittance_flow(&RemittanceFlowParams {
+        caller: caller.clone(),
+        total_amount: 10000i128,
+        family_wallet: mock_id.clone(),
+        remittance_split: mock_id.clone(),
+        savings: mock_id.clone(),
+        bills: mock_id.clone(),
+        insurance: mock_id.clone(),
+        goal_id: 1,
+        bill_id: 1,
+        policy_id: 1,
+    });
+
+    assert_eq!(
+        result,
+        Err(Ok(OrchestratorError::RemittanceFlowRolledBack)),
+        "Unsigned flow: bill failure after savings must roll back"
+    );
+    assert!(!client.get_execution_state(), "Lock must be released after rollback");
+}
+
+/// Test that the unsigned flow returns `RemittanceFlowRolledBack` when
+/// insurance fails after both savings and bills succeeded, triggering
+/// compensation for both prior steps.
+#[test]
+fn test_unsigned_rollback_insurance_failure_returns_rolled_back() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let orchestrator_id = env.register_contract(None, Orchestrator);
+    let client = OrchestratorClient::new(&env, &orchestrator_id);
+
+    let mock_id = env.register_contract(None, mock_unsigned_fail_insurance::Contract);
+    let caller = Address::generate(&env);
+
+    let result = client.try_execute_remittance_flow(&RemittanceFlowParams {
+        caller: caller.clone(),
+        total_amount: 10000i128,
+        family_wallet: mock_id.clone(),
+        remittance_split: mock_id.clone(),
+        savings: mock_id.clone(),
+        bills: mock_id.clone(),
+        insurance: mock_id.clone(),
+        goal_id: 1,
+        bill_id: 1,
+        policy_id: 1,
+    });
+
+    assert_eq!(
+        result,
+        Err(Ok(OrchestratorError::RemittanceFlowRolledBack)),
+        "Unsigned flow: insurance failure after savings+bills must roll back"
+    );
+    assert!(!client.get_execution_state(), "Lock must be released after rollback");
+}
+
+/// Test that the unsigned flow returns `CrossContractCallFailed` (not
+/// `RemittanceFlowRolledBack`) when the FIRST write step fails — there
+/// is nothing to compensate.
+#[test]
+fn test_unsigned_rollback_first_step_fails_no_compensation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let orchestrator_id = env.register_contract(None, Orchestrator);
+    let client = OrchestratorClient::new(&env, &orchestrator_id);
+
+    let mock_id = env.register_contract(None, mock_fail_savings::Contract);
+    let caller = Address::generate(&env);
+
+    let result = client.try_execute_remittance_flow(&RemittanceFlowParams {
+        caller: caller.clone(),
+        total_amount: 10000i128,
+        family_wallet: mock_id.clone(),
+        remittance_split: mock_id.clone(),
+        savings: mock_id.clone(),
+        bills: mock_id.clone(),
+        insurance: mock_id.clone(),
+        goal_id: 1,
+        bill_id: 1,
+        policy_id: 1,
+    });
+
+    assert_eq!(
+        result,
+        Err(Ok(OrchestratorError::CrossContractCallFailed)),
+        "Unsigned flow: first-step failure must return CrossContractCallFailed"
+    );
+    assert!(!client.get_execution_state(), "Lock must be released");
+}
+
+/// Test that the fan-out flow (`execute_flow_fanout`) returns
+/// `CrossContractCallFailed` (not `RemittanceFlowRolledBack`) when a
+/// downstream step fails — verification that compensation is NOT applied
+/// on the fan-out path (unlike the atomic flow which compensates).
+#[test]
+fn test_fanout_flow_does_not_compensate_on_bill_failure() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let orchestrator_id = env.register_contract(None, Orchestrator);
+    let client = OrchestratorClient::new(&env, &orchestrator_id);
+
+    // Use the bill-failing mock with compensation support; fan-out should
+    // return CrossContractCallFailed rather than attempting rollback.
+    let owner = Address::generate(&env);
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, mock_unsigned_fail_bill::Contract);
+    let ins = env.register_contract(None, MockContract);
+    client.init(&owner, &fw, &rs, &sg, &bp, &ins);
+
+    let caller = Address::generate(&env);
+
+    // Fan-out with failing bill step: must NOT compensate (no rollback)
+    let result = client.try_execute_flow_fanout(&caller, &10000i128);
+
+    // The fan-out captures per-step results — the outer Result should be Ok,
+    // but the inner FanOutFlowResult.all_succeeded should be false.
+    assert!(result.is_ok(), "fan-out must not panic on step failure");
+    if let Ok(Ok(fanout)) = &result {
+        assert!(!fanout.all_succeeded, "fan-out must report all_succeeded=false when a step fails");
+        assert!(!fanout.savings.succeeded, "savings step must report failure when bill mock panics");
+        assert!(!fanout.bills.succeeded, "bill step must report failure");
+    } else if let Ok(Err(e)) = &result {
+        // If the fan-out returns an error, it must be CrossContractCallFailed,
+        // NOT RemittanceFlowRolledBack (which would indicate compensation).
+        assert_eq!(
+            *e,
+            OrchestratorError::CrossContractCallFailed,
+            "fan-out failure must be CrossContractCallFailed, not RemittanceFlowRolledBack"
+        );
+    }
+
+    // Lock must be released even on fan-out failure
+    assert!(!client.get_execution_state(), "Lock must be released after fan-out failure");
+}
+
 // ---------------------------------------------------------------------------
 // Flow lifecycle event tests (unsigned + signed parity)
 // ---------------------------------------------------------------------------
