@@ -759,6 +759,34 @@ pub fn get_rate_limit_status(env: &Env, caller: &Address, operation: Symbol) -> 
     (record.count, window_id + RATE_LIMIT_WINDOW_SECONDS)
 }
 
+/// Typed error returned by [`require_future_timestamp`].
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum TimestampError {
+    /// `t <= env.ledger().timestamp()`.
+    NotInFuture = 1,
+}
+
+/// Central guard for validating a caller-supplied timestamp (e.g. an expiry
+/// or unlock time) is strictly after the current ledger time.
+///
+/// # Contract
+/// - `Ok(())` when `t > env.ledger().timestamp()`.
+/// - [`TimestampError::NotInFuture`] when `t` is equal to or before now.
+///
+/// Setting an already-past (or exactly-now) expiry would leave the affected
+/// state immediately expired with no way to recover except admin
+/// intervention, so this is checked at the boundary rather than left to each
+/// call site to reimplement.
+pub fn require_future_timestamp(env: &Env, t: u64) -> Result<(), TimestampError> {
+    if t <= env.ledger().timestamp() {
+        Err(TimestampError::NotInFuture)
+    } else {
+        Ok(())
+    }
+}
+
 /// Verifies that an amount is above the dust threshold (1 stroop).
 ///
 /// Returns `Ok(())` when `amount > 1`, otherwise returns an error.

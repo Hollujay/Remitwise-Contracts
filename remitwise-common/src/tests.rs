@@ -3058,3 +3058,37 @@ mod investigation_epoch_guard_comprehensive_tests {
         );
     }
 }
+
+mod require_future_timestamp_tests {
+    use super::*;
+
+    fn env_at(timestamp: u64) -> Env {
+        let env = Env::default();
+        env.ledger().with_mut(|li| li.timestamp = timestamp);
+        env
+    }
+
+    #[test]
+    fn rejects_timestamp_equal_to_now() {
+        let env = env_at(1_000);
+        assert_eq!(
+            require_future_timestamp(&env, 1_000),
+            Err(TimestampError::NotInFuture)
+        );
+    }
+
+    #[test]
+    fn rejects_timestamp_before_now() {
+        let env = env_at(1_000);
+        assert_eq!(
+            require_future_timestamp(&env, 999),
+            Err(TimestampError::NotInFuture)
+        );
+    }
+
+    #[test]
+    fn accepts_timestamp_after_now() {
+        let env = env_at(1_000);
+        assert_eq!(require_future_timestamp(&env, 1_001), Ok(()));
+    }
+}
