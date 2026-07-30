@@ -15,6 +15,10 @@ Scope: current implementation in this repository, focused on auditability and mi
 
 ## Storage Key Naming Conventions
 
+Contract documentation uses `Storage` consistently for Soroban instance and
+persistent storage. `Store` is reserved for describing an action (for example,
+storing a report), not as the name of a storage abstraction or key namespace.
+
 All storage keys follow strict naming conventions to ensure consistency and compatibility with Soroban's `symbol_short!` macro:
 
 - **Maximum length:** 9 characters (enforced by `symbol_short!`)
