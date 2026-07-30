@@ -176,7 +176,6 @@ jobs:
       run: 'cargo audit --deny warnings
 
         '
-      continue-on-error: true
   workspace-invariants:
     name: Workspace Invariants
     runs-on: ubuntu-latest
