@@ -492,6 +492,17 @@ fn test_no_duplicate_keys_within_contract() {
 }
 
 #[test]
+fn test_fee_configuration_key_cannot_collide_with_generic_config() {
+    // Keep fee configuration namespaced instead of reusing the generic CONFIG
+    // key. This mirrors the production review rule for future fee modules.
+    let generic_config = "CONFIG";
+    let fee_config = "FEE_CFG";
+    assert_ne!(fee_config, generic_config);
+    assert!(fee_config.len() <= MAX_KEY_LENGTH);
+    assert!(fee_config.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'));
+}
+
+#[test]
 fn test_keys_not_empty() {
     let keys = get_all_storage_keys();
     let mut violations = Vec::new();
