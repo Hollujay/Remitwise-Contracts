@@ -2038,6 +2038,45 @@ pub fn verify_slash_signature(
 ///     Err(TagError::Empty) | Err(TagError::TooLong) => { /* map to caller error */ }
 /// }
 /// ```
+/// Validates and canonicalizes a single tag: enforces `1..=TAG_MAX_LEN` byte
+/// length and the `[a-z0-9\-_]` charset, lowercasing ASCII uppercase letters.
+///
+/// Extracted from [`canonicalize_tags_checked`] so single-tag lookups (e.g.
+/// a tag-index query keyed on one caller-supplied tag) don't need to
+/// allocate a one-element `Vec` just to call the batch API.
+pub fn canonicalize_tag_checked(
+    env: &soroban_sdk::Env,
+    tag: &soroban_sdk::String,
+) -> Result<soroban_sdk::String, TagError> {
+    let len = tag.len();
+    if len == 0 {
+        return Err(TagError::Empty);
+    }
+    if len > TAG_MAX_LEN {
+        return Err(TagError::TooLong);
+    }
+    let mut buf = [0u8; 32];
+    tag.copy_into_slice(&mut buf[..len as usize]);
+    for (position, byte) in buf.iter_mut().take(len as usize).enumerate() {
+        if byte.is_ascii_uppercase() {
+            *byte += b'a' - b'A';
+        }
+        let b = *byte;
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
+            return Err(TagError::InvalidChar {
+                position: position as u32,
+            });
+        }
+    }
+    let s = match core::str::from_utf8(&buf[..len as usize]) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(TagError::InvalidChar { position: 0 });
+        }
+    };
+    Ok(soroban_sdk::String::from_str(env, s))
+}
+
 pub fn canonicalize_tags_checked(
     env: &soroban_sdk::Env,
     tags: &soroban_sdk::Vec<soroban_sdk::String>,
@@ -2047,33 +2086,7 @@ pub fn canonicalize_tags_checked(
     }
     let mut out = soroban_sdk::Vec::new(env);
     for tag in tags.iter() {
-        let len = tag.len();
-        if len == 0 {
-            return Err(TagError::Empty);
-        }
-        if len > TAG_MAX_LEN {
-            return Err(TagError::TooLong);
-        }
-        let mut buf = [0u8; 32];
-        tag.copy_into_slice(&mut buf[..len as usize]);
-        for (position, byte) in buf.iter_mut().take(len as usize).enumerate() {
-            if byte.is_ascii_uppercase() {
-                *byte += b'a' - b'A';
-            }
-            let b = *byte;
-            if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_') {
-                return Err(TagError::InvalidChar {
-                    position: position as u32,
-                });
-            }
-        }
-        let s = match core::str::from_utf8(&buf[..len as usize]) {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(TagError::InvalidChar { position: 0 });
-            }
-        };
-        out.push_back(soroban_sdk::String::from_str(env, s));
+        out.push_back(canonicalize_tag_checked(env, &tag)?);
     }
     Ok(out)
 }
