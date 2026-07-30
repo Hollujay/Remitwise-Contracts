@@ -30,6 +30,10 @@ enum DataKey {
 
 pub const MAX_PAUSED_FUNCTIONS: u32 = 10;
 
+/// Contract version, bumped on every on-chain-upgrade-relevant change so
+/// callers/tooling can detect which build of the WASM they are talking to.
+pub const CONTRACT_VERSION: u32 = 1;
+
 /// Emitted when the killswitch admin is successfully transferred.
 #[contracttype]
 #[derive(Clone)]
@@ -132,6 +136,15 @@ impl EmergencyKillswitch {
             (old_epoch, new_epoch),
         );
         Ok(new_epoch)
+    }
+
+    /// Returns [`CONTRACT_VERSION`], the version of this deployed WASM build.
+    ///
+    /// Intended for off-chain tooling/upgrade scripts to confirm which
+    /// contract version they are interacting with before/after an upgrade.
+    /// No authentication required — the version is observable on-chain.
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
     }
 
     /// Return the current kill-switch epoch.
