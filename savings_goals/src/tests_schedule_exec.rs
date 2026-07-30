@@ -698,3 +698,37 @@ fn test_one_shot_schedule_deactivates_after_execution() {
         "goal balance must not change after the schedule is deactivated"
     );
 }
+
+// ─── Pause must be respected on the permissionless executor ──────────────────
+
+/// Issue #1589: `execute_due_savings_schedules` is permissionless and only
+/// checked the separate global kill switch, never this contract's own
+/// `Paused` flag set via `pause()`. That meant an admin pausing the contract
+/// had no effect on scheduled fund movement: anyone could still call the
+/// executor and have it credit due schedules while the contract was
+/// supposedly paused.
+#[test]
+fn test_execute_due_savings_schedules_returns_empty_when_paused() {
+    let env = Env::default();
+    let (client, owner) = setup(&env);
+
+    let goal_id = make_goal(&env, &client, &owner, 2_000);
+    client.create_savings_schedule(&owner, &goal_id, &500, &3_000, &0);
+
+    client.set_pause_admin(&owner, &owner);
+    client.pause(&owner);
+
+    set_ledger_time(&env, 2, 3_500);
+    let executed = client.execute_due_savings_schedules();
+
+    assert_eq!(
+        executed.len(),
+        0,
+        "executor must not run any schedules while the contract is paused"
+    );
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(
+        goal.current_amount, 0,
+        "goal balance must be untouched while paused"
+    );
+}

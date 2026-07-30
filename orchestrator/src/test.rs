@@ -1011,6 +1011,81 @@ fn signed_flow_hash(
     compute_test_hash(_env, symbol_short!("flow"), nonce, amount, deadline)
 }
 
+// ---------------------------------------------------------------------------
+// Configurable deadline window (init_with_deadline_window)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_deadline_window_defaults_to_max_when_plain_init_used() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
+
+    assert_eq!(client.get_deadline_window(), MAX_DEADLINE_WINDOW_SECS);
+}
+
+#[test]
+fn init_with_deadline_window_rejects_zero_window() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+
+    let result =
+        client.try_init_with_deadline_window(&owner, &fw, &rs, &sg, &bp, &ins, &0u64);
+    assert_eq!(result, Err(Ok(OrchestratorError::InvalidAmount)));
+}
+
+#[test]
+fn init_with_deadline_window_enforces_custom_window() {
+    let (env, owner) = setup_test();
+    let (_, client) = register_orchestrator(&env);
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, MockContract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+
+    let custom_window = 500u64;
+    client.init_with_deadline_window(&owner, &fw, &rs, &sg, &bp, &ins, &custom_window);
+    assert_eq!(client.get_deadline_window(), custom_window);
+
+    let executor = Address::generate(&env);
+
+    // Before this fix, MAX_DEADLINE_WINDOW_SECS (3600s) was hardcoded, so a
+    // deadline 1000s out would have been accepted. With a configured 500s
+    // window it must now be rejected.
+    let too_far_deadline = env.ledger().timestamp() + 1000;
+    let hash = signed_flow_hash(&env, &executor, 10000, 0, too_far_deadline);
+    let result = client.try_execute_remittance_flow_signed(
+        &executor,
+        &10000,
+        &0u64,
+        &too_far_deadline,
+        &hash,
+        &0u64,
+    );
+    assert_eq!(result, Err(Ok(OrchestratorError::DeadlineExpired)));
+
+    // A deadline within the custom window passes the deadline check (it may
+    // still fail later for unrelated reasons, e.g. mock dependencies not
+    // implementing every entrypoint -- this only pins the deadline gate).
+    let ok_deadline = env.ledger().timestamp() + 400;
+    let hash2 = signed_flow_hash(&env, &executor, 10000, 0, ok_deadline);
+    let result2 = client.try_execute_remittance_flow_signed(
+        &executor,
+        &10000,
+        &0u64,
+        &ok_deadline,
+        &hash2,
+        &0u64,
+    );
+    assert_ne!(result2, Err(Ok(OrchestratorError::DeadlineExpired)));
+}
+
 #[test]
 fn test_rollback_savings_step_returns_cross_contract_error() {
     let (env, owner) = setup_test();
@@ -1035,6 +1110,46 @@ fn test_rollback_savings_step_returns_cross_contract_error() {
     assert!(!client.get_execution_state());
     // Nonce not advanced on failure.
     assert_eq!(client.get_nonce(&executor), 0);
+}
+
+#[test]
+fn test_cross_contract_failure_emits_step_and_cause() {
+    // Before this fix, every downstream failure collapsed into the same
+    // generic `CrossContractCallFailed` error with no way to tell which step
+    // failed or whether it was the callee's own logic vs. the invocation
+    // itself. Assert the swallowed information is now surfaced as an event.
+    let (env, owner) = setup_test();
+    let (orchestrator_id, client) = register_orchestrator(&env);
+
+    let fw = env.register_contract(None, MockContract);
+    let rs = env.register_contract(None, MockContract);
+    let sg = env.register_contract(None, mock_fail_savings::Contract);
+    let bp = env.register_contract(None, MockContract);
+    let ins = env.register_contract(None, MockContract);
+    init_orchestrator_with_mocks(&env, &client, &owner, fw, rs, sg, bp, ins);
+
+    let executor = Address::generate(&env);
+    let deadline = signed_flow_deadline(&env);
+    let hash = signed_flow_hash(&env, &executor, 10000, 0, deadline);
+    let _ =
+        client.try_execute_remittance_flow_signed(&executor, &10000, &0, &deadline, &hash, &0u64);
+
+    let expected_topics = soroban_sdk::vec![
+        &env,
+        symbol_short!("cctx_err").into_val(&env),
+        symbol_short!("savings").into_val(&env),
+    ];
+    let matched: std::vec::Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(cid, topics, _)| cid == &orchestrator_id && *topics == expected_topics)
+        .collect();
+    assert_eq!(matched.len(), 1);
+    // `mock_fail_savings` panics rather than returning a typed error, so this
+    // is an invocation-level failure (`rejected_by_contract == false`).
+    let (_, _, data) = &matched[0];
+    assert_eq!(bool::from_val(&env, data), false);
 }
 
 #[test]
@@ -1474,6 +1589,31 @@ fn test_pre_upgrade_roundtrip() {
 
     // Version should be restored
     assert_eq!(client.get_version(), 1);
+}
+
+#[test]
+fn test_pre_upgrade_bumps_persistent_snapshot_ttl() {
+    // Before this fix, pre_upgrade wrote SNAPSHOT_KEY / SNAP_TS to the
+    // *persistent* bucket but only ever called extend_ttl on the *instance*
+    // bucket elsewhere in the contract -- the persistent entry's TTL was
+    // never bumped at all, so it could be archived off the ledger (breaking
+    // restore_from_snapshot) well before the instance itself expired.
+    use soroban_sdk::testutils::storage::Persistent;
+
+    let (env, owner) = setup_test();
+    let (orchestrator_id, client) = register_orchestrator(&env);
+    init_orchestrator(&env, &client, &owner);
+    env.ledger().with_mut(|li| li.max_entry_ttl = 6_000_000);
+
+    client.pre_upgrade(&owner);
+
+    let ttl = env.as_contract(&orchestrator_id, || {
+        env.storage().persistent().get_ttl(&SNAPSHOT_KEY)
+    });
+    assert_eq!(
+        ttl, PERSISTENT_BUMP_AMOUNT,
+        "persistent snapshot entry must be bumped with the persistent bucket's amount"
+    );
 }
 
 #[test]

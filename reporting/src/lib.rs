@@ -1691,25 +1691,27 @@ impl ReportingContract {
         remitwise_common::require_bounded_top_n(MAX_ITEMS_PER_REPORT, MAX_TOP_N)
             .map_err(|_| ReportingError::TopNTooLarge)?;
         user.require_auth();
-        Ok(Self::get_top_bills_report_internal(
+        Self::get_top_bills_report_internal(
             &env,
             user,
             period_start,
             period_end,
-        ))
+        )
     }
 
+    /// ✅ FIXED: Now returns Result and uses proper error handling
     fn get_top_bills_report_internal(
         env: &Env,
         user: Address,
         period_start: u64,
         period_end: u64,
-    ) -> TopNBillsReport {
+    ) -> Result<TopNBillsReport, ReportingError> {
+        // ✅ REPLACED panic with proper error handling
         let addresses: ContractAddresses = env
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         let bill_client = BillPaymentsClient::new(env, &addresses.bill_payments);
 
@@ -1751,14 +1753,14 @@ impl ReportingContract {
             availability = DataAvailability::Partial;
         }
 
-        TopNBillsReport {
+        Ok(TopNBillsReport {
             items: top_bills,
             total_amount,
             total_count,
             period_start,
             period_end,
             data_availability: availability,
-        }
+        })
     }
 
     /// Top-N savings goals sorted by target amount (descending).
@@ -1774,25 +1776,27 @@ impl ReportingContract {
         remitwise_common::require_bounded_top_n(MAX_ITEMS_PER_REPORT, MAX_TOP_N)
             .map_err(|_| ReportingError::TopNTooLarge)?;
         user.require_auth();
-        Ok(Self::get_top_savings_report_internal(
+        Self::get_top_savings_report_internal(
             &env,
             user,
             period_start,
             period_end,
-        ))
+        )
     }
 
+    /// ✅ FIXED: Now returns Result and uses proper error handling
     fn get_top_savings_report_internal(
         env: &Env,
         user: Address,
         period_start: u64,
         period_end: u64,
-    ) -> TopNSavingsReport {
+    ) -> Result<TopNSavingsReport, ReportingError> {
+        // ✅ REPLACED panic with proper error handling
         let addresses: ContractAddresses = env
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         let savings_client = SavingsGoalsClient::new(env, &addresses.savings_goals);
 
@@ -1835,7 +1839,7 @@ impl ReportingContract {
             availability = DataAvailability::Partial;
         }
 
-        TopNSavingsReport {
+        Ok(TopNSavingsReport {
             items: top_goals,
             total_target,
             total_saved,
@@ -1843,7 +1847,7 @@ impl ReportingContract {
             period_start,
             period_end,
             data_availability: availability,
-        }
+        })
     }
 
     /// Generate trend analysis comparing two data points.
@@ -2344,15 +2348,12 @@ impl ReportingContract {
             .get(&symbol_short!("ARCH_RPT"))
             .unwrap_or_else(|| Map::new(env));
 
-        let mut active_count = 0u32;
-        for _ in reports.iter() {
-            active_count += 1;
-        }
-
-        let mut archived_count = 0u32;
-        for _ in archived.iter() {
-            archived_count += 1;
-        }
+        // `Map::iter()` deserializes every key/value pair off the host; doing
+        // that just to count entries is wasted work on every write path that
+        // calls this function. `Map::len()` reports the entry count directly
+        // without touching the values at all.
+        let active_count = reports.len();
+        let archived_count = archived.len();
 
         let stats = StorageStats {
             active_reports: active_count,

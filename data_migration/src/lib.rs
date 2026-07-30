@@ -55,6 +55,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+mod csv_transfer;
+pub use csv_transfer::{export_to_csv, import_goals_from_csv};
+
 /// Encrypted migration payload marker prefix.
 ///
 /// Format: `enc:v1:<base64>`
@@ -365,44 +368,47 @@ impl ExportSnapshot {
     /// Compute the SHA-256 checksum for this snapshot.
     pub fn compute_checksum(&self) -> Result<String, MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        Ok(Self::checksum_for_parts(
-            self.header.version,
-            &self.header.format,
-            &payload_bytes,
-        ))
+        Ok(self.compute_checksum_bytes(&payload_bytes))
     }
 
+    fn compute_checksum_bytes(&self, payload_bytes: &[u8]) -> String {
+        Self::checksum_for_parts(self.header.version, &self.header.format, payload_bytes)
+    }
+
+    fn compute_simple_checksum_bytes(&self, payload_bytes: &[u8]) -> String {
+        Self::simple_checksum_for_parts(self.header.version, &self.header.format, payload_bytes)
+    }
+
+    #[cfg(test)]
     fn compute_simple_checksum(&self) -> Result<String, MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        Ok(Self::simple_checksum_for_parts(
-            self.header.version,
-            &self.header.format,
-            &payload_bytes,
-        ))
-    }
-
-    fn compute_legacy_simple_checksum(&self) -> Result<String, MigrationError> {
-        let payload_bytes = self.payload_bytes()?;
-        Ok(Self::legacy_simple_checksum(&payload_bytes))
+        Ok(self.compute_simple_checksum_bytes(&payload_bytes))
     }
 
     /// Verify that the stored checksum matches the current payload.
     pub fn verify_checksum(&self) -> bool {
+        match self.payload_bytes() {
+            Ok(payload_bytes) => self.verify_checksum_bytes(&payload_bytes),
+            Err(_) => false,
+        }
+    }
+
+    /// Same as [`verify_checksum`], but reuses an already-computed
+    /// `payload_bytes` (the canonical serialization that both the checksum
+    /// and the payload-bounds check independently need) instead of
+    /// re-deriving it. `payload_bytes` is invariant for a given `&self`, so
+    /// callers that already have it (e.g. [`validate_for_import`]) should
+    /// call this instead of [`verify_checksum`] to avoid re-running the
+    /// canonicalization pass.
+    fn verify_checksum_bytes(&self, payload_bytes: &[u8]) -> bool {
         match self.header.hash_algorithm {
-            ChecksumAlgorithm::Sha256 => self
-                .compute_checksum()
-                .map(|c| self.header.checksum == c)
-                .unwrap_or(false),
-            ChecksumAlgorithm::Simple => self
-                .compute_simple_checksum()
-                .map(|expected| {
-                    self.header.checksum == expected
-                        || self
-                            .compute_legacy_simple_checksum()
-                            .map(|legacy| self.header.checksum == legacy)
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false),
+            ChecksumAlgorithm::Sha256 => {
+                self.header.checksum == self.compute_checksum_bytes(payload_bytes)
+            }
+            ChecksumAlgorithm::Simple => {
+                self.header.checksum == self.compute_simple_checksum_bytes(payload_bytes)
+                    || self.header.checksum == Self::legacy_simple_checksum(payload_bytes)
+            }
         }
     }
 
@@ -414,7 +420,16 @@ impl ExportSnapshot {
     /// Validate payload size and logical record bounds.
     pub fn validate_payload_constraints(&self) -> Result<(), MigrationError> {
         let payload_bytes = self.payload_bytes()?;
-        validate_payload_bounds(self.payload.record_count(), payload_bytes.len())
+        Self::validate_payload_constraints_bytes(&self.payload, &payload_bytes)
+    }
+
+    /// Same as [`validate_payload_constraints`], but reuses an
+    /// already-computed `payload_bytes` -- see [`verify_checksum_bytes`].
+    fn validate_payload_constraints_bytes(
+        payload: &SnapshotPayload,
+        payload_bytes: &[u8],
+    ) -> Result<(), MigrationError> {
+        validate_payload_bounds(payload.record_count(), payload_bytes.len())
     }
 
     /// Validate snapshot for import: version, payload bounds, checksum, and semantic invariants.
@@ -447,7 +462,11 @@ impl ExportSnapshot {
             });
         }
 
-        self.validate_payload_constraints()?;
+        // Computed once and reused for both the bounds check and the
+        // checksum verification below, instead of each independently
+        // re-running the canonical serialization pass over the payload.
+        let payload_bytes = self.payload_bytes()?;
+        Self::validate_payload_constraints_bytes(&self.payload, &payload_bytes)?;
 
         if !matches!(
             self.header.hash_algorithm,
@@ -456,7 +475,7 @@ impl ExportSnapshot {
             return Err(MigrationError::UnknownHashAlgorithm);
         }
 
-        if !self.verify_checksum() {
+        if !self.verify_checksum_bytes(&payload_bytes) {
             return Err(MigrationError::ChecksumMismatch);
         }
 
@@ -776,87 +795,6 @@ pub fn export_to_binary(snapshot: &ExportSnapshot) -> Result<Vec<u8>, MigrationE
     Ok(bytes)
 }
 
-/// Sanitize a CSV field to prevent formula injection.
-///
-/// # Security model
-///
-/// CSV-injection occurs when spreadsheet applications interpret leading characters
-/// as formulas:
-/// - `=` starts a formula
-/// - `+` starts a formula in some applications
-/// - `-` starts a formula in some applications
-/// - `@` starts a formula (Excel functions)
-///
-/// This function prefixes any field beginning with these characters with a single quote (`'`),
-/// which instructs spreadsheet applications to treat the field as text literal.
-///
-/// # Examples
-///
-/// ```text
-/// "=IMPORTXML(...)" → "'=IMPORTXML(...)"
-/// "+1+1" → "'+1+1"
-/// "-1+2" → "'-1+2"
-/// "@SUM(A1:A10)" → "'@SUM(A1:A10)"
-/// "normal text" → "normal text"
-/// "123" → "123"
-/// ```
-fn sanitize_csv_field(field: &str) -> String {
-    if field.starts_with('=')
-        || field.starts_with('+')
-        || field.starts_with('-')
-        || field.starts_with('@')
-    {
-        format!("'{}", field)
-    } else {
-        field.to_string()
-    }
-}
-
-/// Export to CSV (for tabular payloads only; e.g. goals list).
-///
-/// # Security
-///
-/// Fields beginning with `=`, `+`, `-`, or `@` are escaped with a leading single quote (`'`)
-/// to prevent formula injection in spreadsheet applications. This ensures that goal names
-/// and notes containing formula-like prefixes are safely exported as text literals.
-pub fn export_to_csv(payload: &SavingsGoalsExport) -> Result<Vec<u8>, MigrationError> {
-    let payload_bytes = serialize_json_bytes(payload)?;
-    validate_payload_bounds(payload.goals.len(), payload_bytes.len())?;
-
-    let mut wtr = csv::Writer::from_writer(Vec::new());
-    wtr.write_record([
-        "id",
-        "owner",
-        "name",
-        "target_amount",
-        "current_amount",
-        "target_date",
-        "locked",
-    ])
-    .map_err(|e| MigrationError::InvalidFormat(e.to_string()))?;
-
-    for goal in &payload.goals {
-        wtr.write_record(&[
-            goal.id.to_string(),
-            sanitize_csv_field(&goal.owner),
-            sanitize_csv_field(&goal.name),
-            goal.target_amount.to_string(),
-            goal.current_amount.to_string(),
-            goal.target_date.to_string(),
-            goal.locked.to_string(),
-        ])
-        .map_err(|e| MigrationError::InvalidFormat(e.to_string()))?;
-    }
-
-    wtr.flush()
-        .map_err(|e| MigrationError::InvalidFormat(e.to_string()))?;
-    let csv_bytes = wtr
-        .into_inner()
-        .map_err(|e| MigrationError::InvalidFormat(e.to_string()))?;
-    validate_payload_bounds(payload.goals.len(), csv_bytes.len())?;
-    Ok(csv_bytes)
-}
-
 /// ⚠️ WARNING: This function does NOT encrypt the payload.
 ///
 /// The `enc:v1:` format is an **encoding/marker only** and provides no
@@ -1164,84 +1102,6 @@ pub fn import_from_binary_untracked(bytes: &[u8]) -> Result<ExportSnapshot, Migr
     import_from_binary(bytes, &mut tracker, 0)
 }
 
-/// Import goals from CSV into SavingsGoalsExport.
-pub fn import_goals_from_csv(bytes: &[u8]) -> Result<Vec<SavingsGoalExport>, MigrationError> {
-    // Pre-deserialization check: Ensure the raw CSV input bytes do not exceed
-    // MAX_MIGRATION_PAYLOAD_BYTES to prevent DoS from oversized requests before parsing.
-    // Logical record count (MAX_MIGRATION_RECORDS) is validated during iteration.
-    if bytes.len() > MAX_MIGRATION_PAYLOAD_BYTES {
-        return Err(MigrationError::PayloadTooLarge {
-            size: bytes.len(),
-            max: MAX_MIGRATION_PAYLOAD_BYTES,
-        });
-    }
-
-    let mut rdr = csv::Reader::from_reader(bytes);
-    let mut goals = Vec::new();
-    for result in rdr.deserialize() {
-        if goals.len() == MAX_MIGRATION_RECORDS {
-            return Err(MigrationError::TooManyRecords {
-                count: MAX_MIGRATION_RECORDS + 1,
-                max: MAX_MIGRATION_RECORDS,
-            });
-        }
-
-        let record: CsvGoalRow =
-            result.map_err(|e| MigrationError::DeserializeError(e.to_string()))?;
-
-        if record.target_amount < 0 || record.current_amount < 0 {
-            return Err(MigrationError::ValidationFailed(
-                "negative amounts are not allowed".into(),
-            ));
-        }
-
-        goals.push(SavingsGoalExport {
-            id: record.id,
-            owner: record.owner,
-            name: record.name,
-            target_amount: record.target_amount,
-            current_amount: record.current_amount,
-            target_date: record.target_date,
-            locked: record.locked,
-        });
-    }
-    Ok(goals)
-}
-
-fn deserialize_csv_safe_field<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = String::deserialize(deserializer)?;
-    Ok(strip_csv_formula_prefix(&raw))
-}
-
-fn strip_csv_formula_prefix(value: &str) -> String {
-    if let Some(stripped) = value.strip_prefix('\'') {
-        if stripped.starts_with('=')
-            || stripped.starts_with('+')
-            || stripped.starts_with('-')
-            || stripped.starts_with('@')
-        {
-            return stripped.to_string();
-        }
-    }
-
-    value.to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct CsvGoalRow {
-    id: u32,
-    #[serde(deserialize_with = "deserialize_csv_safe_field")]
-    owner: String,
-    #[serde(deserialize_with = "deserialize_csv_safe_field")]
-    name: String,
-    target_amount: i64,
-    current_amount: i64,
-    target_date: u64,
-    locked: bool,
-}
 
 /// Version compatibility check for migration scripts.
 pub fn check_version_compatibility(version: u32) -> Result<(), MigrationError> {

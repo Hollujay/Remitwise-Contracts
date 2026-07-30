@@ -92,7 +92,8 @@ pub enum FlowStep {
 }
 
 use remitwise_common::{
-    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, SNAPSHOT_KEY, SNAPSHOT_VERSION,
+    EventCategory, EventPriority, RemitwiseEvents, CONTRACT_VERSION, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 
 // Storage TTL constants for active data
@@ -408,6 +409,62 @@ impl Orchestrator {
         bill_payments: Address,
         insurance: Address,
     ) -> Result<bool, OrchestratorError> {
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            None,
+        )
+    }
+
+    /// Same as [`init`], but also configures the signed-flow deadline window
+    /// (see `require_nonce_hardened`) instead of relying on the
+    /// `MAX_DEADLINE_WINDOW_SECS` default. Kept as a separate entrypoint so
+    /// `init`'s signature and existing callers are unaffected.
+    ///
+    /// # Errors
+    /// - `InvalidAmount` if `deadline_window_secs == 0` -- a zero window
+    ///   would make every signed flow deadline immediately expired.
+    pub fn init_with_deadline_window(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: u64,
+    ) -> Result<bool, OrchestratorError> {
+        if deadline_window_secs == 0 {
+            return Err(OrchestratorError::InvalidAmount);
+        }
+        Self::init_internal(
+            env,
+            caller,
+            family_wallet,
+            remittance_split,
+            savings_goals,
+            bill_payments,
+            insurance,
+            Some(deadline_window_secs),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init_internal(
+        env: Env,
+        caller: Address,
+        family_wallet: Address,
+        remittance_split: Address,
+        savings_goals: Address,
+        bill_payments: Address,
+        insurance: Address,
+        deadline_window_secs: Option<u64>,
+    ) -> Result<bool, OrchestratorError> {
         caller.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
@@ -466,6 +523,11 @@ impl Orchestrator {
         env.storage()
             .instance()
             .set(&symbol_short!("NONCES"), &Map::<Address, u64>::new(&env));
+        if let Some(window) = deadline_window_secs {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("DL_WIN"), &window);
+        }
 
         // Store default execution parameters for the signed flow.
         // These can be updated by the owner via a future admin method.
@@ -708,6 +770,18 @@ impl Orchestrator {
     /// in basis points (1% = 100 basis points).
     ///
     /// This is a read-only view function that does not require authorization.
+    /// Returns the configured signed-flow deadline window in seconds -- the
+    /// maximum distance into the future a caller-supplied deadline may sit
+    /// (see `require_nonce_hardened`). Falls back to `MAX_DEADLINE_WINDOW_SECS`
+    /// if `init_with_deadline_window` was never called (i.e. plain `init` was
+    /// used). No authentication required — observable on-chain.
+    pub fn get_deadline_window(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("DL_WIN"))
+            .unwrap_or(MAX_DEADLINE_WINDOW_SECS)
+    }
+
     pub fn get_fee_schedule(env: Env) -> Option<(u32, u32, u32, u32)> {
         let rs_addr: Address = env.storage().instance().get(&symbol_short!("RS_ADDR"))?;
 
@@ -1071,6 +1145,23 @@ impl Orchestrator {
         env.storage()
             .persistent()
             .set(&symbol_short!("SNAP_TS"), &env.ledger().timestamp());
+        // The only other extend_ttl call in this contract targets the
+        // *instance* bucket (see `extend_instance_ttl`); it does not, and
+        // cannot, keep this *persistent* entry alive. Without bumping the
+        // persistent bucket's own TTL here, the snapshot can be archived off
+        // the ledger and `restore_from_snapshot` starts failing with
+        // `InvalidDependency` well before `PERSISTENT_LIFETIME_THRESHOLD`
+        // would suggest, even while the instance itself is still healthy.
+        env.storage().persistent().extend_ttl(
+            &SNAPSHOT_KEY,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().extend_ttl(
+            &symbol_short!("SNAP_TS"),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("snap_pre")),
             SNAPSHOT_VERSION,
@@ -1341,21 +1432,31 @@ impl Orchestrator {
 
         if savings_amt > 0 {
             let s_client = interface::SavingsGoalsClient::new(env, &routing.savings);
-            if s_client
-                .try_add_to_goal(caller, &routing.goal_id, &savings_amt)
-                .is_err()
-            {
-                return Err(OrchestratorError::CrossContractCallFailed);
+            match s_client.try_add_to_goal(caller, &routing.goal_id, &savings_amt) {
+                Ok(Ok(_)) => savings_done = true,
+                Ok(Err(_)) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), true);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
+                Err(_) => {
+                    Self::emit_cross_contract_failure(env, symbol_short!("savings"), false);
+                    return Err(OrchestratorError::CrossContractCallFailed);
+                }
             }
-            savings_done = true;
         }
 
         if bills_amt > 0 {
             let b_client = interface::BillPaymentsClient::new(env, &routing.bills);
-            if b_client
-                .try_pay_bill(caller, &routing.bill_id, &bills_amt)
-                .is_err()
-            {
+            let rejected_by_contract = match b_client.try_pay_bill(caller, &routing.bill_id, &bills_amt) {
+                Ok(Ok(_)) => {
+                    bills_done = true;
+                    None
+                }
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("bills"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
@@ -1368,15 +1469,17 @@ impl Orchestrator {
                 }
                 return Err(OrchestratorError::CrossContractCallFailed);
             }
-            bills_done = true;
         }
 
         if insurance_amt > 0 {
             let i_client = interface::InsuranceClient::new(env, &routing.insurance);
-            if i_client
-                .try_pay_premium(caller, &routing.policy_id, &insurance_amt)
-                .is_err()
-            {
+            let rejected_by_contract = match i_client.try_pay_premium(caller, &routing.policy_id, &insurance_amt) {
+                Ok(Ok(_)) => None,
+                Ok(Err(_)) => Some(true),
+                Err(_) => Some(false),
+            };
+            if let Some(from_contract) = rejected_by_contract {
+                Self::emit_cross_contract_failure(env, symbol_short!("insur"), from_contract);
                 if compensate_on_failure {
                     Self::compensate_savings(
                         env,
@@ -1393,6 +1496,22 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    /// Surfaces the inner failure that `run_remittance_fan_out` would otherwise
+    /// swallow behind a single generic [`OrchestratorError::CrossContractCallFailed`].
+    ///
+    /// `step` identifies which downstream call failed; `rejected_by_contract`
+    /// distinguishes a deliberate rejection from the callee's own logic (`true`,
+    /// e.g. its own validation/auth failed) from a lower-level invocation failure
+    /// (`false`, e.g. the address is not a deployed contract with a matching
+    /// interface). Both were previously indistinguishable from the caller's
+    /// perspective.
+    fn emit_cross_contract_failure(env: &Env, step: Symbol, rejected_by_contract: bool) {
+        env.events().publish(
+            (symbol_short!("cctx_err"), step),
+            rejected_by_contract,
+        );
     }
 
     /// Compensate a savings-goal contribution if it was applied.
@@ -1462,7 +1581,7 @@ impl Orchestrator {
         if deadline <= now {
             return Err(OrchestratorError::DeadlineExpired);
         }
-        if deadline > now + MAX_DEADLINE_WINDOW_SECS {
+        if deadline > now + Self::get_deadline_window(env.clone()) {
             return Err(OrchestratorError::DeadlineExpired);
         }
 
@@ -1472,11 +1591,25 @@ impl Orchestrator {
 
         Self::require_nonce(env, address, nonce)?;
 
-        if request_hash != expected_hash {
+        if !Self::constant_time_eq(request_hash, expected_hash) {
             return Err(OrchestratorError::InvalidNonce);
         }
 
         Ok(())
+    }
+
+    /// Constant-time equality check for the request-hash binding above.
+    ///
+    /// Plain `!=` on primitives is not guaranteed to be constant-time --
+    /// depending on target and optimization level, integer comparison can be
+    /// lowered in ways whose timing varies with where the values first
+    /// differ. XOR-then-compare-to-zero never branches on the operands
+    /// themselves: every input pair takes the same path regardless of
+    /// whether (or where) `a` and `b` differ, which is what we want when
+    /// comparing a caller-supplied value against a secret-derived binding
+    /// hash.
+    fn constant_time_eq(a: u64, b: u64) -> bool {
+        (a ^ b) == 0
     }
 
     /// Guard that rejects calls while any operation is in progress.
