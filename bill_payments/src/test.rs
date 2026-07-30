@@ -694,6 +694,38 @@ mod testsuit {
         assert_eq!(result, Err(Ok(Error::BillNotFound)));
     }
 
+    /// Issue #1591: a paid bill is a terminal, audited record. `cancel_bill`
+    /// must not be usable to delete it -- that would silently destroy the
+    /// payment record (and paid_at trail) instead of going through
+    /// `reverse_payment`, the dedicated typed reversal path.
+    #[test]
+    fn test_cancel_bill_rejects_already_paid_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Test"),
+            &100,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        client.pay_bill(&owner, &bill_id);
+
+        let result = client.try_cancel_bill(&owner, &bill_id);
+        assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
+
+        // The bill record must survive the rejected cancellation attempt.
+        let bill = client.get_bill(&bill_id).expect("paid bill must still exist");
+        assert!(bill.paid);
+    }
+
     #[test]
     fn test_cancel_bill_owner_succeeds() {
         let env = Env::default();

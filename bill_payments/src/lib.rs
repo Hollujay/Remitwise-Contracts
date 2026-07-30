@@ -2981,6 +2981,13 @@ impl BillPayments {
         if bill.owner != caller {
             return Err(BillPaymentsError::Unauthorized);
         }
+        // A paid bill is a terminal, audited record: cancelling it here would
+        // silently delete that record (and its paid_at trail) without going
+        // through reverse_payment, the dedicated typed reversal path that
+        // preserves the bill and correctly restores the unpaid total.
+        if bill.paid {
+            return Err(BillPaymentsError::BillAlreadyPaid);
+        }
 
         // Release external_ref if it exists
         if let Some(ref r) = bill.external_ref {
