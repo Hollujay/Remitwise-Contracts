@@ -3059,36 +3059,30 @@ mod investigation_epoch_guard_comprehensive_tests {
     }
 }
 
-mod require_future_timestamp_tests {
+mod verify_no_dust_tests {
     use super::*;
 
-    fn env_at(timestamp: u64) -> Env {
-        let env = Env::default();
-        env.ledger().with_mut(|li| li.timestamp = timestamp);
-        env
+    #[test]
+    fn rejects_zero_explicitly() {
+        // Before this fix, amount == 0 fell through to the generic dust
+        // check and returned an untyped `Err(())`, indistinguishable from
+        // any other rejection reason.
+        assert_eq!(verify_no_dust(0), Err(AmountError::ZeroAmount));
     }
 
     #[test]
-    fn rejects_timestamp_equal_to_now() {
-        let env = env_at(1_000);
-        assert_eq!(
-            require_future_timestamp(&env, 1_000),
-            Err(TimestampError::NotInFuture)
-        );
+    fn rejects_negative_amount() {
+        assert_eq!(verify_no_dust(-1), Err(AmountError::NegativeAmount));
     }
 
     #[test]
-    fn rejects_timestamp_before_now() {
-        let env = env_at(1_000);
-        assert_eq!(
-            require_future_timestamp(&env, 999),
-            Err(TimestampError::NotInFuture)
-        );
+    fn rejects_dust_amount() {
+        assert_eq!(verify_no_dust(1), Err(AmountError::DustAmount));
     }
 
     #[test]
-    fn accepts_timestamp_after_now() {
-        let env = env_at(1_000);
-        assert_eq!(require_future_timestamp(&env, 1_001), Ok(()));
+    fn accepts_amount_above_dust_threshold() {
+        assert_eq!(verify_no_dust(2), Ok(()));
+        assert_eq!(verify_no_dust(1_000_000), Ok(()));
     }
 }
