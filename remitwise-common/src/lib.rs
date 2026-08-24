@@ -2,7 +2,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use soroban_sdk::{
-    contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol,
+    contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol,
     TryFromVal, Val,
 };
 pub mod tokens;
@@ -1570,7 +1570,7 @@ impl Timestamp {
     /// - Day: Returns the day index since Unix epoch (UTC), i.e. `timestamp / 86400`.
     /// - Week: Returns the week index since Unix epoch (UTC), i.e. `timestamp / 604800`.
     /// - Month: Returns the [YYYYMM] encoding as (year * 100 + month), e.g. 202412 for December 2024.
-    ///          Handles proleptic Gregorian conversion in UTC. Leap seconds are ignored.
+    ///   Handles proleptic Gregorian conversion in UTC. Leap seconds are ignored.
     ///
     /// Pre-1970 timestamps are not representable through the `u64` API (day 0
     /// is 1970-01-01). The function never panics and returns a `u64` for every
@@ -2381,6 +2381,7 @@ impl RemitwiseEvents {
         env.events().publish(topics, data);
         #[cfg(test)]
         {
+            use soroban_sdk::IntoVal;
             let val: soroban_sdk::Val = data.into_val(env);
             env.events().publish(topics, val);
         }
@@ -2467,12 +2468,12 @@ impl RemitwiseEvents {
 ///
 /// # Arguments
 /// * `env`   – Soroban environment.
-/// * `op`    – A short [`Symbol`] identifying the operation being audited
-///             (e.g. `symbol_short!("flow_exec")`).  Must be ≤ 9 bytes
-///             ([`SHORT_SYMBOL_MAX_LEN`]).
+    /// * `op`    – A short [`Symbol`] identifying the operation being audited
+    ///   (e.g. `symbol_short!("flow_exec")`).  Must be ≤ 9 bytes
+    ///   ([`SHORT_SYMBOL_MAX_LEN`]).
 /// * `actor` – The [`Address`] of the principal that triggered the operation.
-/// * `meta`  – An arbitrary `IntoVal` payload carrying operation-specific
-///             context (amount, result, IDs, etc.).  Keep it compact.
+    /// * `meta`  – An arbitrary `IntoVal` payload carrying operation-specific
+    ///   context (amount, result, IDs, etc.).  Keep it compact.
 ///
 /// # Panics (test-only)
 /// In `#[cfg(test)]` builds the call panics if the serialized `meta` payload
@@ -2508,7 +2509,6 @@ where
     // RemitwiseEvents::emit so oversized payloads are caught immediately.
     #[cfg(test)]
     {
-        use soroban_sdk::xdr::ToXdr;
         use soroban_sdk::{IntoVal, TryFromVal};
         let val: soroban_sdk::Val = data.into_val(env);
         if let Ok(sc_val) = soroban_sdk::xdr::ScVal::try_from_val(env, &val) {
@@ -2522,7 +2522,6 @@ where
             }
         }
         env.events().publish(topics, val);
-        return;
     }
 
     #[cfg(not(test))]

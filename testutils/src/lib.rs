@@ -57,7 +57,6 @@ macro_rules! setup_test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
 
     /// same_address returns true when both arguments point to the identical address.
     #[test]

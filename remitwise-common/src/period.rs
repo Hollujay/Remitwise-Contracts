@@ -78,14 +78,12 @@ pub fn require_matching_period_key(
 /// unit-testable.
 ///
 /// # Arguments
-/// * `period_start`  — the timestamp at which the period started (e.g. the
-///                      Unix-second start boundary of a `pk = YYYYMM`, the
-///                      day-start of a `pk = YYYYMMDD`, or the Unix-second
-///                      boundary itself).
-/// * `now`           — the current ledger timestamp
-///                      (`env.ledger().timestamp()`).
-/// * `is_archived`   — `true` iff the caller has already moved the
-///                      period to its archive storage; `false` otherwise.
+    /// * `period_start`  — the timestamp at which the period started (e.g. the
+    ///   Unix-second start boundary of a `pk = YYYYMM`, the day-start of a
+    ///   `pk = YYYYMMDD`, or the Unix-second boundary itself).
+    /// * `now`           — the current ledger timestamp (`env.ledger().timestamp()`).
+    /// * `is_archived`   — `true` iff the caller has already moved the period to
+    ///   its archive storage; `false` otherwise.
 ///
 /// # Errors
 /// * [`PeriodKeyError::PeriodNotActive`] when `is_archived == true` or

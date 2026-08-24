@@ -1128,7 +1128,7 @@ proptest! {
         assert!(month >= 197001);
         let y = month / 100;
         let m = month % 100;
-        assert!(y >= 1970 && m >= 1 && m <= 12);
+        assert!(y >= 1970 && (1..=12).contains(&m));
     }
 }
 
