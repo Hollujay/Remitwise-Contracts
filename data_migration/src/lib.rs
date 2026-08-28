@@ -480,6 +480,12 @@ impl ExportSnapshot {
         }
 
         validate_payload_semantics(&self.payload)?;
+        let report = self.reconciliation_report()?;
+        if !report.gap_free {
+            return Err(MigrationError::ValidationFailed(
+                "snapshot reconciliation records must be gap-free".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -615,6 +621,13 @@ pub enum MigrationError {
     ValidationFailed(String),
     DeserializeError(String),
     DuplicateImport,
+    MigrationAlreadyInProgress,
+    NoMigrationInProgress,
+    StaleMigrationAttempt,
+    MigrationProgressOutOfBounds {
+        processed: usize,
+        total: usize,
+    },
     /// Returned by [`verify_migration_completed`] when the caller attempts a write
     /// operation before the migration has been explicitly marked complete via
     /// [`MigrationTracker::mark_completed`]. This guard prevents partially-applied
@@ -664,6 +677,18 @@ impl std::fmt::Display for MigrationError {
             MigrationError::ValidationFailed(s) => write!(f, "validation failed: {}", s),
             MigrationError::DeserializeError(s) => write!(f, "deserialize error: {}", s),
             MigrationError::DuplicateImport => write!(f, "duplicate payload import detected"),
+            MigrationError::MigrationAlreadyInProgress => {
+                write!(f, "migration already in progress")
+            }
+            MigrationError::NoMigrationInProgress => write!(f, "no migration in progress"),
+            MigrationError::StaleMigrationAttempt => {
+                write!(f, "stale migration attempt does not match active migration")
+            }
+            MigrationError::MigrationProgressOutOfBounds { processed, total } => write!(
+                f,
+                "migration progress out of bounds: processed {} of {} records",
+                processed, total
+            ),
             MigrationError::MigrationNotCompleted => write!(
                 f,
                 "migration not completed: write operations are not permitted until the migration is marked complete"
@@ -674,6 +699,27 @@ impl std::fmt::Display for MigrationError {
 
 impl std::error::Error for MigrationError {}
 
+/// Lifecycle state for an observed migration attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MigrationAttemptStatus {
+    InProgress,
+    Completed,
+    Failed,
+    RolledBack,
+}
+
+/// Observable state for a single import attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationAttempt {
+    pub checksum: String,
+    pub version: u32,
+    pub started_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub total_records: usize,
+    pub processed_records: usize,
+    pub status: MigrationAttemptStatus,
+}
+
 /// Tracks imported migration payloads to prevent replay attacks and duplicate restores.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MigrationTracker {
@@ -682,6 +728,10 @@ pub struct MigrationTracker {
     /// [`verify_migration_completed`] checks this flag and returns
     /// [`MigrationError::MigrationNotCompleted`] until it is set.
     pub completed: bool,
+    #[serde(default)]
+    active_attempt: Option<MigrationAttempt>,
+    #[serde(default)]
+    attempt_history: Vec<MigrationAttempt>,
 }
 
 impl MigrationTracker {
@@ -689,6 +739,8 @@ impl MigrationTracker {
         Self {
             imported_payloads: HashMap::new(),
             completed: false,
+            active_attempt: None,
+            attempt_history: Vec::new(),
         }
     }
 
@@ -710,23 +762,141 @@ impl MigrationTracker {
         self.completed
     }
 
+    /// Return the currently-running migration attempt, if one exists.
+    pub fn active_attempt(&self) -> Option<&MigrationAttempt> {
+        self.active_attempt.as_ref()
+    }
+
+    /// Return completed, failed, and rolled-back attempts in transition order.
+    pub fn attempt_history(&self) -> &[MigrationAttempt] {
+        &self.attempt_history
+    }
+
+    /// Begin an observable migration attempt without applying state.
+    ///
+    /// This lets operators persist a checkpoint before any state mutation, then
+    /// call [`MigrationTracker::record_progress`] after each applied batch and
+    /// [`MigrationTracker::mark_imported`] only after the full snapshot has
+    /// been applied.
+    pub fn begin_import(
+        &mut self,
+        snapshot: &ExportSnapshot,
+        timestamp_ms: u64,
+    ) -> Result<MigrationAttempt, MigrationError> {
+        snapshot.validate_for_import()?;
+        let identity = snapshot_identity(snapshot);
+        if self.imported_payloads.contains_key(&identity) {
+            return Err(MigrationError::DuplicateImport);
+        }
+        if self.active_attempt.is_some() {
+            return Err(MigrationError::MigrationAlreadyInProgress);
+        }
+
+        let attempt = MigrationAttempt {
+            checksum: identity.0,
+            version: identity.1,
+            started_at_ms: timestamp_ms,
+            updated_at_ms: timestamp_ms,
+            total_records: snapshot.payload.record_count(),
+            processed_records: 0,
+            status: MigrationAttemptStatus::InProgress,
+        };
+        self.active_attempt = Some(attempt.clone());
+        Ok(attempt)
+    }
+
+    /// Record monotonic progress for the active migration attempt.
+    pub fn record_progress(
+        &mut self,
+        snapshot: &ExportSnapshot,
+        processed_records: usize,
+        timestamp_ms: u64,
+    ) -> Result<(), MigrationError> {
+        let identity = snapshot_identity(snapshot);
+        let attempt = self
+            .active_attempt
+            .as_mut()
+            .ok_or(MigrationError::NoMigrationInProgress)?;
+
+        if attempt.checksum != identity.0 || attempt.version != identity.1 {
+            return Err(MigrationError::StaleMigrationAttempt);
+        }
+        if processed_records < attempt.processed_records
+            || processed_records > attempt.total_records
+        {
+            return Err(MigrationError::MigrationProgressOutOfBounds {
+                processed: processed_records,
+                total: attempt.total_records,
+            });
+        }
+
+        attempt.processed_records = processed_records;
+        attempt.updated_at_ms = timestamp_ms;
+        Ok(())
+    }
+
+    /// Mark the active migration attempt as failed and clear it for rollback/retry.
+    pub fn fail_import(
+        &mut self,
+        snapshot: &ExportSnapshot,
+        timestamp_ms: u64,
+    ) -> Result<(), MigrationError> {
+        let identity = snapshot_identity(snapshot);
+        let mut attempt = self
+            .active_attempt
+            .take()
+            .ok_or(MigrationError::NoMigrationInProgress)?;
+
+        if attempt.checksum != identity.0 || attempt.version != identity.1 {
+            self.active_attempt = Some(attempt);
+            return Err(MigrationError::StaleMigrationAttempt);
+        }
+
+        attempt.updated_at_ms = timestamp_ms;
+        attempt.status = MigrationAttemptStatus::Failed;
+        self.attempt_history.push(attempt);
+        Ok(())
+    }
+
     /// Mark a payload as imported.
     pub fn mark_imported(
         &mut self,
         snapshot: &ExportSnapshot,
         timestamp_ms: u64,
     ) -> Result<(), MigrationError> {
-        let identity = (snapshot.header.checksum.clone(), snapshot.header.version);
+        let identity = snapshot_identity(snapshot);
         if self.imported_payloads.contains_key(&identity) {
             return Err(MigrationError::DuplicateImport);
         }
-        self.imported_payloads.insert(identity, timestamp_ms);
+
+        if let Some(active) = &self.active_attempt {
+            if active.checksum != identity.0 || active.version != identity.1 {
+                return Err(MigrationError::MigrationAlreadyInProgress);
+            }
+        }
+
+        self.imported_payloads
+            .insert(identity.clone(), timestamp_ms);
+
+        let mut attempt = self.active_attempt.take().unwrap_or(MigrationAttempt {
+            checksum: identity.0,
+            version: identity.1,
+            started_at_ms: timestamp_ms,
+            updated_at_ms: timestamp_ms,
+            total_records: snapshot.payload.record_count(),
+            processed_records: snapshot.payload.record_count(),
+            status: MigrationAttemptStatus::Completed,
+        });
+        attempt.processed_records = attempt.total_records;
+        attempt.updated_at_ms = timestamp_ms;
+        attempt.status = MigrationAttemptStatus::Completed;
+        self.attempt_history.push(attempt);
         Ok(())
     }
 
     /// Check if a snapshot has already been imported.
     pub fn is_imported(&self, snapshot: &ExportSnapshot) -> bool {
-        let identity = (snapshot.header.checksum.clone(), snapshot.header.version);
+        let identity = snapshot_identity(snapshot);
         self.imported_payloads.contains_key(&identity)
     }
 
@@ -737,6 +907,104 @@ impl MigrationTracker {
     pub fn unmark_imported_by_identity(&mut self, checksum: &str, version: u32) {
         let identity = (checksum.to_string(), version);
         self.imported_payloads.remove(&identity);
+    }
+
+    fn mark_rolled_back_by_identity(&mut self, checksum: &str, version: u32, timestamp_ms: u64) {
+        let Some(active) = self.active_attempt.take() else {
+            return;
+        };
+
+        if active.checksum != checksum || active.version != version {
+            self.active_attempt = Some(active);
+            return;
+        }
+
+        let mut rolled_back = active;
+        rolled_back.updated_at_ms = timestamp_ms;
+        rolled_back.status = MigrationAttemptStatus::RolledBack;
+        self.attempt_history.push(rolled_back);
+    }
+}
+
+fn snapshot_identity(snapshot: &ExportSnapshot) -> (String, u32) {
+    (snapshot.header.checksum.clone(), snapshot.header.version)
+}
+
+/// One deterministic record identity in a snapshot reconciliation report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRecordRef {
+    pub ordinal: usize,
+    pub key: String,
+}
+
+/// Deterministic, gap-free view of the logical records carried by a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotReconciliationReport {
+    pub snapshot_checksum: String,
+    pub version: u32,
+    pub payload_type: String,
+    pub total_records: usize,
+    pub records: Vec<SnapshotRecordRef>,
+    pub gap_free: bool,
+}
+
+impl ExportSnapshot {
+    /// Build a deterministic reconciliation report for this snapshot.
+    ///
+    /// Records are sorted by stable logical keys and assigned contiguous
+    /// zero-based ordinals. If duplicate logical keys are present, the snapshot
+    /// is rejected because reconciliation cannot prove that every record is
+    /// represented exactly once.
+    pub fn reconciliation_report(&self) -> Result<SnapshotReconciliationReport, MigrationError> {
+        let (payload_type, mut keys) = match &self.payload {
+            SnapshotPayload::RemittanceSplit(export) => (
+                "remittance_split",
+                vec![format!("remittance_split:{}", export.owner)],
+            ),
+            SnapshotPayload::SavingsGoals(export) => (
+                "savings_goals",
+                export
+                    .goals
+                    .iter()
+                    .map(|goal| format!("savings_goal:{}:{}", goal.owner, goal.id))
+                    .collect(),
+            ),
+            SnapshotPayload::Generic(entries) => (
+                "generic",
+                entries.keys().map(|key| format!("generic:{key}")).collect(),
+            ),
+        };
+
+        keys.sort();
+        for pair in keys.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(MigrationError::ValidationFailed(format!(
+                    "duplicate migration reconciliation record key {}",
+                    pair[0]
+                )));
+            }
+        }
+
+        let records: Vec<SnapshotRecordRef> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, key)| SnapshotRecordRef { ordinal, key })
+            .collect();
+        let total_records = self.payload.record_count();
+        let gap_free = records.len() == total_records
+            && records
+                .iter()
+                .enumerate()
+                .all(|(expected, record)| record.ordinal == expected);
+
+        Ok(SnapshotReconciliationReport {
+            snapshot_checksum: self.header.checksum.clone(),
+            version: self.header.version,
+            payload_type: payload_type.to_string(),
+            total_records,
+            records,
+            gap_free,
+        })
     }
 }
 
@@ -1102,7 +1370,6 @@ pub fn import_from_binary_untracked(bytes: &[u8]) -> Result<ExportSnapshot, Migr
     import_from_binary(bytes, &mut tracker, 0)
 }
 
-
 /// Version compatibility check for migration scripts.
 pub fn check_version_compatibility(version: u32) -> Result<(), MigrationError> {
     if (MIN_SUPPORTED_VERSION..=SCHEMA_VERSION).contains(&version) {
@@ -1229,6 +1496,11 @@ impl RollbackMetadata {
         }
 
         tracker.unmark_imported_by_identity(&self.attempted_checksum, self.attempted_version);
+        tracker.mark_rolled_back_by_identity(
+            &self.attempted_checksum,
+            self.attempted_version,
+            self.timestamp_ms,
+        );
         Ok(())
     }
 
@@ -2285,6 +2557,160 @@ mod tests {
             "attempted version should appear: {description}"
         );
         assert!(rb.has_previous_state());
+    }
+
+    #[test]
+    fn test_migration_tracker_records_gap_free_progress_to_completion() {
+        let snapshot = ExportSnapshot::new(sample_savings_payload(), ExportFormat::Json);
+        let mut tracker = MigrationTracker::new();
+
+        let attempt = tracker.begin_import(&snapshot, 1_000).unwrap();
+        assert_eq!(attempt.status, MigrationAttemptStatus::InProgress);
+        assert_eq!(attempt.total_records, snapshot.payload.record_count());
+        assert_eq!(attempt.processed_records, 0);
+
+        tracker.record_progress(&snapshot, 1, 1_100).unwrap();
+        assert_eq!(tracker.active_attempt().unwrap().processed_records, 1);
+
+        tracker.mark_imported(&snapshot, 1_200).unwrap();
+        assert!(tracker.active_attempt().is_none());
+        assert!(tracker.is_imported(&snapshot));
+        assert_eq!(tracker.attempt_history().len(), 1);
+
+        let completed = &tracker.attempt_history()[0];
+        assert_eq!(completed.status, MigrationAttemptStatus::Completed);
+        assert_eq!(completed.processed_records, completed.total_records);
+        assert_eq!(completed.updated_at_ms, 1_200);
+    }
+
+    #[test]
+    fn test_migration_progress_rejects_regression_and_overflow() {
+        let snapshot = ExportSnapshot::new(sample_savings_payload(), ExportFormat::Json);
+        let mut tracker = MigrationTracker::new();
+
+        tracker.begin_import(&snapshot, 1_000).unwrap();
+        tracker.record_progress(&snapshot, 1, 1_100).unwrap();
+
+        assert_eq!(
+            tracker.record_progress(&snapshot, 0, 1_200).unwrap_err(),
+            MigrationError::MigrationProgressOutOfBounds {
+                processed: 0,
+                total: 1,
+            }
+        );
+        assert_eq!(
+            tracker.record_progress(&snapshot, 2, 1_300).unwrap_err(),
+            MigrationError::MigrationProgressOutOfBounds {
+                processed: 2,
+                total: 1,
+            }
+        );
+        assert_eq!(tracker.active_attempt().unwrap().processed_records, 1);
+    }
+
+    #[test]
+    fn test_migration_progress_rejects_stale_attempt_identity() {
+        let active = ExportSnapshot::new(sample_savings_payload(), ExportFormat::Json);
+        let stale = ExportSnapshot::new(sample_generic_payload(), ExportFormat::Json);
+        let mut tracker = MigrationTracker::new();
+
+        tracker.begin_import(&active, 1_000).unwrap();
+
+        assert_eq!(
+            tracker.record_progress(&stale, 1, 1_100).unwrap_err(),
+            MigrationError::StaleMigrationAttempt
+        );
+        assert!(tracker.active_attempt().is_some());
+        assert!(!tracker.is_imported(&stale));
+    }
+
+    #[test]
+    fn test_partial_rollback_marks_attempt_rolled_back_and_allows_retry() {
+        let prev = ExportSnapshot::new(sample_remittance_payload(), ExportFormat::Json);
+        let attempted = ExportSnapshot::new(sample_savings_payload(), ExportFormat::Json);
+        let mut state = Some(prev.clone());
+        let mut tracker = MigrationTracker::new();
+        let rb = RollbackMetadata::capture(state.as_ref(), &attempted, 2_000);
+
+        tracker.begin_import(&attempted, 2_001).unwrap();
+        tracker.record_progress(&attempted, 1, 2_002).unwrap();
+        state = Some(attempted.clone());
+
+        rb.restore(&mut state, &mut tracker).unwrap();
+
+        assert_snapshot_equal(&state, &Some(prev));
+        assert!(tracker.active_attempt().is_none());
+        assert!(!tracker.is_imported(&attempted));
+        assert_eq!(tracker.attempt_history().len(), 1);
+        assert_eq!(
+            tracker.attempt_history()[0].status,
+            MigrationAttemptStatus::RolledBack
+        );
+
+        tracker.begin_import(&attempted, 3_000).unwrap();
+        tracker.mark_imported(&attempted, 3_100).unwrap();
+        assert!(tracker.is_imported(&attempted));
+    }
+
+    #[test]
+    fn test_failed_attempt_is_observable_and_retryable() {
+        let attempted = ExportSnapshot::new(sample_generic_payload(), ExportFormat::Json);
+        let mut tracker = MigrationTracker::new();
+
+        tracker.begin_import(&attempted, 1_000).unwrap();
+        tracker.record_progress(&attempted, 2, 1_100).unwrap();
+        tracker.fail_import(&attempted, 1_200).unwrap();
+
+        assert!(tracker.active_attempt().is_none());
+        assert!(!tracker.is_imported(&attempted));
+        assert_eq!(tracker.attempt_history().len(), 1);
+        assert_eq!(
+            tracker.attempt_history()[0].status,
+            MigrationAttemptStatus::Failed
+        );
+
+        tracker.begin_import(&attempted, 2_000).unwrap();
+        tracker.mark_imported(&attempted, 2_100).unwrap();
+        assert!(tracker.is_imported(&attempted));
+    }
+
+    #[test]
+    fn test_reconciliation_report_is_deterministic_and_gap_free() {
+        let payload = SnapshotPayload::SavingsGoals(SavingsGoalsExport {
+            next_id: 3,
+            goals: vec![sample_goal(3), sample_goal(1), sample_goal(2)],
+        });
+        let snapshot = ExportSnapshot::new(payload, ExportFormat::Json);
+
+        let report = snapshot.reconciliation_report().unwrap();
+
+        assert!(report.gap_free);
+        assert_eq!(report.total_records, 3);
+        assert_eq!(
+            report
+                .records
+                .iter()
+                .map(|record| record.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(report.records[0].key, "savings_goal:G1:1");
+        assert_eq!(report.records[2].key, "savings_goal:G1:3");
+    }
+
+    #[test]
+    fn test_duplicate_reconciliation_keys_are_rejected_at_import_boundary() {
+        let payload = SnapshotPayload::SavingsGoals(SavingsGoalsExport {
+            next_id: 1,
+            goals: vec![sample_goal(1), sample_goal(1)],
+        });
+        let snapshot = ExportSnapshot::new(payload, ExportFormat::Json);
+
+        assert!(matches!(
+            snapshot.validate_for_import(),
+            Err(MigrationError::ValidationFailed(message))
+                if message.contains("duplicate migration reconciliation record key")
+        ));
     }
 
     #[test]

@@ -138,6 +138,56 @@ data_migration::check_version_compatibility(snapshot.header.version)?;
 snapshot.validate_for_import()?;
 ```
 
+### Observable and resumable imports
+
+Use a long-lived `MigrationTracker` for production migrations. The tracker
+records an active attempt, monotonic progress checkpoints, and terminal attempt
+history:
+
+```rust
+let mut tracker = MigrationTracker::new();
+let snapshot = data_migration::import_from_json_untracked(&json_bytes)?;
+
+tracker.begin_import(&snapshot, started_at_ms)?;
+tracker.record_progress(&snapshot, processed_records, checkpoint_at_ms)?;
+
+// After all state has been applied:
+tracker.mark_imported(&snapshot, completed_at_ms)?;
+tracker.mark_completed();
+```
+
+Operational guarantees:
+
+- `begin_import` validates the snapshot, then rejects already-imported
+  snapshots and concurrent attempts.
+- `record_progress` is monotonic and cannot exceed the snapshot record count.
+- `fail_import` records a failed terminal attempt without marking the snapshot
+  imported, so the same snapshot can be retried.
+- `RollbackMetadata::restore` clears the active attempt as `RolledBack`, removes
+  the attempted replay marker if one was created, and restores the previous
+  snapshot or empty state.
+- `verify_migration_completed` remains the write gate: callers should block live
+  writes until `mark_completed` has been called after a coherent migration.
+
+### Deterministic reconciliation
+
+Every snapshot can produce a deterministic reconciliation report:
+
+```rust
+let report = snapshot.reconciliation_report()?;
+assert!(report.gap_free);
+```
+
+The report sorts logical record keys and assigns contiguous zero-based ordinals,
+which lets operators compare expected and processed records without cursor gaps.
+`validate_for_import` rejects duplicate logical reconciliation keys because a
+snapshot with ambiguous record identity cannot prove that every payment,
+settlement, goal, or generic record was represented exactly once.
+
+Compatibility impact: existing valid snapshots continue to import. Savings-goal
+snapshots with duplicate `(owner, id)` records are now rejected with
+`MigrationError::ValidationFailed` because they are not safely reconcilable.
+
 ### Semantic invariants enforced at import
 
 `validate_for_import` (and therefore all `import_from_*` helpers) is **fail-closed**: in addition to structural checks it enforces the same business rules the live contracts enforce at write-time.
@@ -150,6 +200,11 @@ snapshot.validate_for_import()?;
 | `Generic` | *(none beyond size/count bounds)* | — |
 
 **Why this matters:** migration is where contract invariants are most easily bypassed, because data arrives pre-formed rather than through guarded entry-points. A split config that sums to 73% or 140%, or a savings snapshot with a wound-back `next_id`, would produce corrupt on-chain state that the contract would subsequently refuse to touch — a silent data-integrity bug introduced at the import boundary.
+
+Reconciliation identity is also enforced at this boundary. Savings-goal
+snapshots with duplicate `(owner, id)` logical records are rejected because
+pagination and settlement reconciliation cannot prove that each record was
+processed exactly once when two records share the same stable key.
 
 ## Tracked vs Untracked duplicate protection
 
