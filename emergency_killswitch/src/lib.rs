@@ -159,7 +159,7 @@ impl EmergencyKillswitch {
             if signer == env.current_contract_address() {
                 return Err(Error::InvalidAdmin);
             }
-            for prior in signers.iter().take(index as u32) {
+            for prior in signers.iter().take(index) {
                 if prior == signer {
                     return Err(Error::DuplicateSigner);
                 }
