@@ -2077,6 +2077,13 @@ impl BillPayments {
     /// * `Unauthorized` - If `caller != bill.owner`
     /// * `InvalidDueDate` - If child due_date arithmetic overflows `u64`
     /// * `InvalidFrequency` - If period arithmetic overflows `u64`
+    ///
+    /// # Concurrency / retry contract
+    /// A stale, duplicate, or failed `pay_bill` call must not mutate state. The
+    /// function checks `BillNotFound` and `BillAlreadyPaid` before writing any
+    /// changes, and if a concurrent request serializes after the first successful
+    /// payment, the retry sees the terminal paid state and returns
+    /// `BillAlreadyPaid` without creating a second child or altering the unpaid total.
     pub fn pay_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         remitwise_common::require_no_active_kill_switch(&env)
             .unwrap_or_else(|e| soroban_sdk::panic_with_error!(&env, e));

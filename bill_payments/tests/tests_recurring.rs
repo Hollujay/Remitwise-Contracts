@@ -481,3 +481,32 @@ fn test_sum_unpaid_bills_equals_get_total_unpaid() {
     );
     assert_eq!(sum_after_pay_recurring, get_total_after_pay_recurring);
 }
+
+#[test]
+fn test_recurring_duplicate_and_stale_operations_do_not_mutate_state() {
+    let h = RecurringHarness::new(10_000);
+    let due_date = 100_000u64;
+    let original_total = 2_500i128;
+
+    let bill_id = h.create_recurring("Water", original_total, due_date, 7, "XLM");
+    let before_next_id = h.client.get_bill(&(bill_id + 1)).is_none();
+    assert!(before_next_id, "no child should exist before payment");
+
+    h.pay_at(bill_id, due_date);
+    assert_eq!(h.client.get_total_unpaid(&h.owner), original_total, "child replaces parent in unpaid total");
+    assert_eq!(h.client.get_bill(&(bill_id + 1)).unwrap().amount, original_total, "child must preserve amount");
+
+    let retry = h.client.try_pay_bill(&h.owner, &bill_id);
+    assert_eq!(retry, Err(Ok(BillPaymentsError::BillAlreadyPaid)), "stale pay must be rejected");
+    assert_eq!(h.client.get_total_unpaid(&h.owner), original_total, "duplicate pay must not alter unpaid totals");
+    assert_eq!(h.client.get_bill(&(bill_id + 1)).unwrap().id, bill_id + 1, "duplicate pay must not create another child");
+
+    let cancelled = h.client.try_cancel_bill(&h.owner, &(bill_id + 1));
+    assert!(cancelled.is_ok(), "latest child is active and cancellable");
+    assert!(h.client.get_bill(&(bill_id + 1)).is_none(), "cancellation removes the child from storage");
+
+    let stale_cancel = h.client.try_cancel_bill(&h.owner, &(bill_id + 1));
+    assert_eq!(stale_cancel, Err(Ok(BillPaymentsError::BillNotFound)), "cancel retry must be rejected without hidden state");
+    assert_eq!(h.client.get_total_unpaid(&h.owner), 0, "cancelled child must be removed from unpaid totals");
+    assert!(h.client.get_bill(&(bill_id + 2)).is_none(), "no hidden follow-on child is created by stale cancel");
+}
