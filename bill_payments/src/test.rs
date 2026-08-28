@@ -3158,4 +3158,373 @@ mod testsuit {
         client.unpause(&admin);
         assert!(!client.is_paused());
     }
+
+    // ===================================================================
+    // ATOMIC ROLLBACK TESTS
+    // ===================================================================
+
+    /// Verify that pay_bill_atomic returns a correct receipt for
+    /// non-recurring bills.
+    #[test]
+    fn test_pay_bill_atomic_non_recurring_receipt() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Rent"),
+            &500,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        let receipt = client.pay_bill_atomic(&owner, &bill_id).unwrap();
+        assert_eq!(receipt.bill_id, bill_id);
+        assert_eq!(receipt.paid_amount, 500);
+        assert!(receipt.child_bill_id.is_none());
+        assert!(receipt.child_due_date.is_none());
+
+        // Bill is actually paid
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert!(bill.paid);
+    }
+
+    /// Verify that pay_bill_atomic returns correct receipt for
+    /// recurring bills (with child bill info).
+    #[test]
+    fn test_pay_bill_atomic_recurring_receipt() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Internet"),
+            &1000,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        let receipt = client.pay_bill_atomic(&owner, &bill_id).unwrap();
+        assert_eq!(receipt.bill_id, bill_id);
+        assert_eq!(receipt.paid_amount, 1000);
+        assert!(receipt.child_bill_id.is_some());
+        assert!(receipt.child_due_date.is_some());
+
+        let child_id = receipt.child_bill_id.unwrap();
+        let child_due = receipt.child_due_date.unwrap();
+        assert_eq!(child_due, 1_000_000 + 30 * 86400);
+
+        // Child bill exists and is unpaid
+        let child = client.get_bill(&child_id).unwrap();
+        assert!(!child.paid);
+        assert!(child.recurring);
+    }
+
+    /// Verify that pay_bill_atomic fails cleanly (no partial state)
+    /// when bill is already paid.
+    #[test]
+    fn test_pay_bill_atomic_already_paid_no_partial_state() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Bill"),
+            &100,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Pay it once
+        client.pay_bill(&owner, &bill_id);
+
+        // Try paying again — should fail with BillAlreadyPaid
+        let result = client.try_pay_bill_atomic(&owner, &bill_id);
+        assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
+
+        // Verify no child bill was created (no partial state)
+        let bill = client.get_bill(&2);
+        assert!(bill.is_none(), "no child bill should exist after failed atomic pay");
+    }
+
+    /// Verify batch_pay_bills with a mix of valid and invalid bill IDs.
+    /// Invalid IDs are skipped; valid ones are processed. No partial
+    /// state is left from invalid entries.
+    #[test]
+    fn test_batch_pay_bills_mixed_valid_invalid() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let id1 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Bill1"),
+            &100,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        let id2 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Bill2"),
+            &200,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Include invalid IDs (non-existent, already paid, wrong owner)
+        let bill_ids = soroban_sdk::vec![&env, id1, 999, id2, 888];
+        let count = client.batch_pay_bills(&owner, &bill_ids);
+        assert_eq!(count, 2);
+
+        // Both valid bills are paid
+        assert!(client.get_bill(&id1).unwrap().paid);
+        assert!(client.get_bill(&id2).unwrap().paid);
+
+        // No phantom bills created for invalid IDs
+        assert!(client.get_bill(&999).is_none());
+        assert!(client.get_bill(&888).is_none());
+    }
+
+    /// Verify batch_pay_bills is fully atomic: if one recurring bill
+    /// computation overflows, the entire batch reverts with no changes.
+    #[test]
+    fn test_batch_pay_bills_atomic_rollback_on_overflow() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        // Create two recurring bills
+        let id1 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Safe"),
+            &100,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        let id2 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Safe2"),
+            &200,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Both should succeed in batch (no overflow)
+        let bill_ids = soroban_sdk::vec![&env, id1, id2];
+        let count = client.batch_pay_bills(&owner, &bill_ids);
+        assert_eq!(count, 2);
+
+        // Verify child bills were created
+        assert!(client.get_bill(&id1).unwrap().paid);
+        assert!(client.get_bill(&id2).unwrap().paid);
+        // Child bills should exist at id3 and id4
+        let child1 = client.get_bill(&3);
+        assert!(child1.is_some(), "child bill for id1 should exist");
+    }
+
+    /// Verify archive_paid_bills is atomic: if the operation succeeds,
+    all bills are archived; if it fails (none qualifying), no state changes.
+    #[test]
+    fn test_archive_paid_bills_atomic_no_qualifying() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Unpaid"),
+            &100,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Archive with before_timestamp = 0 — no bills qualify (paid_at > 0)
+        let count = client.archive_paid_bills(&owner, &0);
+        assert_eq!(count, 0);
+
+        // Bill should still be in active storage
+        assert!(client.get_bill(&bill_id).is_some());
+    }
+
+    /// Verify archive_paid_bills archives all qualifying bills atomically.
+    #[test]
+    fn test_archive_paid_bills_atomic_all_qualifying() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let id1 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Paid1"),
+            &100,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+        let id2 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Paid2"),
+            &200,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Pay both bills
+        client.pay_bill(&owner, &id1);
+        client.pay_bill(&owner, &id2);
+
+        // Archive with before_timestamp far in the future — both qualify
+        let count = client.archive_paid_bills(&owner, &10_000_000);
+        assert_eq!(count, 2);
+
+        // Both should be removed from active storage
+        assert!(client.get_bill(&id1).is_none());
+        assert!(client.get_bill(&id2).is_none());
+
+        // Both should be in archive
+        assert!(client.get_archived_bill(&id1).is_some());
+        assert!(client.get_archived_bill(&id2).is_some());
+    }
+
+    /// Verify repeated pay_bill calls leave no partial state.
+    #[test]
+    fn test_repeated_pay_bill_no_partial_state() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Bill"),
+            &500,
+            &1_000_000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
+
+        // Pay it
+        client.pay_bill(&owner, &bill_id);
+
+        // Try paying again — must fail cleanly
+        let result = client.try_pay_bill(&owner, &bill_id);
+        assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
+
+        // Verify bill state is exactly as expected
+        let bill = client.get_bill(&bill_id).unwrap();
+        assert!(bill.paid);
+        assert!(bill.paid_at.is_some());
+        assert_eq!(bill.amount, 500);
+    }
+
+    /// Verify that pay_bill and pay_bill_atomic produce identical results.
+    #[test]
+    fn test_pay_bill_atomic_matches_pay_bill() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+        env.mock_all_auths();
+
+        // Create identical recurring bills
+        let id1 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Sub1"),
+            &999,
+            &1_000_000,
+            &true,
+            &7,
+            &None,
+            &String::from_str(&env, "USDC"),
+            &None,
+        );
+        let id2 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Sub2"),
+            &999,
+            &1_000_000,
+            &true,
+            &7,
+            &None,
+            &String::from_str(&env, "USDC"),
+            &None,
+        );
+
+        // Pay first with regular pay_bill
+        client.pay_bill(&owner, &id1);
+        let bill1_after = client.get_bill(&id1).unwrap();
+        let child1 = client.get_bill(&2).unwrap();
+
+        // Pay second with atomic
+        let receipt = client.pay_bill_atomic(&owner, &id2).unwrap();
+        let bill2_after = client.get_bill(&id2).unwrap();
+
+        // Both should have identical state
+        assert_eq!(bill1_after.paid, bill2_after.paid);
+        assert_eq!(bill1_after.amount, bill2_after.amount);
+        assert_eq!(bill1_after.currency, bill2_after.currency);
+
+        // Child bills should have identical due dates
+        assert_eq!(child1.due_date, receipt.child_due_date.unwrap());
+    }
 }
