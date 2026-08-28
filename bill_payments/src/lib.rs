@@ -23,19 +23,18 @@
 //! be evicted independently of) the rest of this contract's instance
 //! storage.
 use remitwise_common::{
-    check_and_increment_rate_limit, clamp_limit, require_stable_currency, require_within_settlement_window,
+    check_and_increment_rate_limit, clamp_limit, require_stable_currency,
+    require_within_settlement_window,
     reversible_op::{BillPaymentsReversible, ReversibleOpError},
-    EventCategory, EventPriority, RemitwiseEvents, Timestamp,
-    ARCHIVE_BUMP_AMOUNT, ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE,
-    MAX_CURRENCY_LEN, MAX_SETTLEMENT_WINDOW_SECS, SNAPSHOT_KEY,
-    SNAPSHOT_VERSION,
+    EventCategory, EventPriority, RemitwiseEvents, Timestamp, ARCHIVE_BUMP_AMOUNT,
+    ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_CURRENCY_LEN, MAX_SETTLEMENT_WINDOW_SECS,
+    SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
 };
-
-
 
 /// Validates that a currency string consists entirely of ASCII alphabetic characters.
 /// This is a first-pass sanity check that rejects non-letter characters before
@@ -409,7 +408,6 @@ pub struct PreUpgradeSnapshot {
 /// watching `AdminEvent::RotationProposed`) time to notice the proposal
 /// and respond, rather than a single signature being an irreversible,
 /// instant takeover.
-
 
 /// A rotation that has been proposed but not yet finalized.
 #[derive(Clone, Debug, PartialEq)]
@@ -1878,7 +1876,9 @@ impl BillPayments {
         if next_cursor > next_schedule_id {
             env.storage().instance().remove(&symbol_short!("EXE_CURS"));
         } else {
-            env.storage().instance().set(&symbol_short!("EXE_CURS"), &next_cursor);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("EXE_CURS"), &next_cursor);
         }
 
         env.storage().instance().set(&STORAGE_BSCHEDS, &schedules);
@@ -3282,8 +3282,8 @@ impl BillPayments {
 
     /// @notice Pay multiple bills in one call.
     ///
-    /// @dev Partial-success semantics are deterministic: invalid bill IDs are skipped and reported,
-    /// while valid IDs continue processing.
+    /// @dev Atomic batch execution: invalid, unauthorized, or expired bill IDs will revert the
+    /// entire batch, leaving no partial state or hidden state changes.
     ///
     /// @param caller Authenticated owner attempting the batch payment.
     /// @param bill_ids Candidate bill IDs to process.
@@ -3317,14 +3317,22 @@ impl BillPayments {
             .unwrap_or(0u32);
 
         for bill_id in bill_ids.iter() {
-            let mut bill = match bills.get(bill_id) {
-                Some(b) => b,
-                None => continue,
-            };
+            let mut bill = bills.get(bill_id).ok_or(Error::BillNotFound)?;
 
-            if bill.owner != caller || bill.paid {
-                continue;
+            if bill.owner != caller {
+                return Err(Error::Unauthorized);
             }
+
+            if bill.paid {
+                return Err(Error::BillAlreadyPaid);
+            }
+
+            require_within_settlement_window(
+                current_time,
+                bill.due_date,
+                MAX_SETTLEMENT_WINDOW_SECS,
+            )
+            .map_err(|_| Error::SettlementWindowExpired)?;
 
             let amount = bill.amount;
             bill.paid = true;

@@ -722,7 +722,9 @@ mod testsuit {
         assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
 
         // The bill record must survive the rejected cancellation attempt.
-        let bill = client.get_bill(&bill_id).expect("paid bill must still exist");
+        let bill = client
+            .get_bill(&bill_id)
+            .expect("paid bill must still exist");
         assert!(bill.paid);
     }
 
@@ -4158,31 +4160,31 @@ mod testsuit {
         assert_eq!(unpaused_state.paused_since, None);
     }
 
-// ========================================================================
-// Tests for set_external_ref authorization and index cleanup (Issue #1410)
-// ========================================================================
+    // ========================================================================
+    // Tests for set_external_ref authorization and index cleanup (Issue #1410)
+    // ========================================================================
 
-#[test]
-fn test_set_external_ref_owner_can_set() {
-    setup_test_env!(env, BillPayments, BillPaymentsClient, client, owner);
+    #[test]
+    fn test_set_external_ref_owner_can_set() {
+        setup_test_env!(env, BillPayments, BillPaymentsClient, client, owner);
 
-    // Create a bill
-    let bill_id = client.create_bill(
-        &owner,
-        &String::from_str(&env, "Electricity"),
-        &1000,
-        &1000000,
-        &false,
-        &0,
-        &None,
-        &String::from_str(&env, "XLM"),
-        &None,
-    );
+        // Create a bill
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Electricity"),
+            &1000,
+            &1000000,
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+            &None,
+        );
 
-    // Owner should be able to set external_ref
-    env.mock_all_auths();
-    let ext_ref = Some(String::from_str(&env, "EXT-123"));
-    client.set_external_ref(&owner, &bill_id, &ext_ref);
+        // Owner should be able to set external_ref
+        env.mock_all_auths();
+        let ext_ref = Some(String::from_str(&env, "EXT-123"));
+        client.set_external_ref(&owner, &bill_id, &ext_ref);
 
         // Verify the external_ref was set
         let bill = client.get_bill(&bill_id).unwrap();
