@@ -722,7 +722,9 @@ mod testsuit {
         assert_eq!(result, Err(Ok(Error::BillAlreadyPaid)));
 
         // The bill record must survive the rejected cancellation attempt.
-        let bill = client.get_bill(&bill_id).expect("paid bill must still exist");
+        let bill = client
+            .get_bill(&bill_id)
+            .expect("paid bill must still exist");
         assert!(bill.paid);
     }
 

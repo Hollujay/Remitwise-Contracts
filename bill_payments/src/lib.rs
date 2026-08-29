@@ -28,10 +28,10 @@ use remitwise_common::{
     require_no_active_kill_switch, require_stable_currency, require_within_settlement_window,
     set_trusted_orchestrator, CrossContractEpochError, TrustedOrchestratorError,
     reversible_op::{BillPaymentsReversible, ReversibleOpError},
-    EventCategory, EventPriority, RemitwiseEvents, Timestamp,
-    ARCHIVE_BUMP_AMOUNT, ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY, INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE,
-    MAX_CURRENCY_LEN, MAX_SETTLEMENT_WINDOW_SECS, SNAPSHOT_KEY,
-    SNAPSHOT_VERSION,
+    EventCategory, EventPriority, RemitwiseEvents, Timestamp, ARCHIVE_BUMP_AMOUNT,
+    ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, DEFAULT_CURRENCY, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_CURRENCY_LEN, MAX_SETTLEMENT_WINDOW_SECS,
+    SNAPSHOT_KEY, SNAPSHOT_VERSION,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
@@ -421,7 +421,6 @@ pub struct PreUpgradeSnapshot {
 /// watching `AdminEvent::RotationProposed`) time to notice the proposal
 /// and respond, rather than a single signature being an irreversible,
 /// instant takeover.
-
 
 /// A rotation that has been proposed but not yet finalized.
 #[derive(Clone, Debug, PartialEq)]
@@ -1890,7 +1889,9 @@ impl BillPayments {
         if next_cursor > next_schedule_id {
             env.storage().instance().remove(&symbol_short!("EXE_CURS"));
         } else {
-            env.storage().instance().set(&symbol_short!("EXE_CURS"), &next_cursor);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("EXE_CURS"), &next_cursor);
         }
 
         env.storage().instance().set(&STORAGE_BSCHEDS, &schedules);
@@ -3437,8 +3438,8 @@ impl BillPayments {
 
     /// @notice Pay multiple bills in one call.
     ///
-    /// @dev Partial-success semantics are deterministic: invalid bill IDs are skipped and reported,
-    /// while valid IDs continue processing.
+    /// @dev Atomic batch execution: invalid, unauthorized, or expired bill IDs will revert the
+    /// entire batch, leaving no partial state or hidden state changes.
     ///
     /// @param caller Authenticated owner attempting the batch payment.
     /// @param bill_ids Candidate bill IDs to process.
