@@ -259,76 +259,24 @@ pub enum BillPaymentsError {
     InvalidTagContent = 32,
     /// Batch operation exceeds the maximum batch size.
     BatchTooLarge = 33,
-    /// The entire contract is paused
-    ContractPaused = 6,
-    /// Caller is not authorized to pause/unpause
-    UnauthorizedPause = 7,
-    /// This specific function is paused
-    FunctionPaused = 8,
-    /// Batch exceeds maximum allowed size
-    BatchTooLarge = 9,
-    /// One or more bills in the batch failed validation
-    BatchValidationFailed = 10,
-    /// Pagination limit is out of allowed range
-    InvalidLimit = 11,
-    /// Due date is in the past or otherwise invalid (error code 12).
-    ///
-    /// Triggered when `due_date == 0` OR `due_date < env.ledger().timestamp()`.
-    /// Boundary: `due_date == now` is **accepted** (strict less-than comparison).
-    InvalidDueDate = 12,
-    /// Tag string is invalid (empty or too long)
-    InvalidTag = 13,
-    /// Tags list is empty
-    EmptyTags = 14,
-    /// Currency code is invalid (empty, too long, or contains non-alphanumeric)
-    InvalidCurrency = 15,
-    /// External reference is invalid (empty, too long, or contains disallowed chars)
-    InvalidExternalRef = 16,
-    /// External reference already used by another active bill for this owner
-    DuplicateExternalRef = 17,
-    /// Owner has reached the maximum number of allowed active bills.
-    OwnerBillCapExceeded = 18,
-    /// Tag content contains invalid characters (must be [a-z0-9-_])
-    InvalidTagContent = 19,
-    /// Rate limit exceeded for this operation
-    RateLimitExceeded = 20,
-    /// Schedule interval is below the minimum allowed duration
-    ScheduleIntervalTooShort = 21,
-    /// Schedule lead time exceeds the maximum allowed duration
-    ScheduleLeadTimeTooLong = 22,
-    /// Owner has reached the maximum number of bill schedules
-    ScheduleCapExceeded = 23,
-    /// Bill schedule with the given ID does not exist
-    ScheduleNotFound = 24,
-    /// Bill schedule is not active
-    ScheduleNotActive = 25,
-    /// The currency is not a recognized stable asset.
-    /// Rebase/deflationary/elastic-supply tokens (e.g., AMPL, OHM) are intentionally rejected.
-    UnsupportedCurrency = 31,
-    /// No pre-upgrade snapshot was persisted for restore.
-    SnapshotNotFound = 26,
-    /// The pre-upgrade snapshot is older than the freshness window.
-    SnapshotTooOld = 27,
-    /// The admin grant has expired and must be refreshed.
-    AdminGrantExpired = 28,
-    /// The page is empty so there is no first item to return.
-    EmptyPage = 29,
-    /// Bill or schedule name is invalid (empty or exceeds max length)
-    InvalidName = 30,
-    /// Settlement occurred outside the allowed settlement window
-    SettlementWindowExpired = 32,
+    /// One or more bills in the batch failed validation.
+    BatchValidationFailed = 34,
+    /// Tag string is invalid (empty or too long).
+    InvalidTag = 35,
+    /// Tags list is empty.
+    EmptyTags = 36,
     /// `set_upgrade_admin` was called with `new_admin` equal to the current
     /// upgrade admin — rejected so a mistyped no-op rotation is caught at the
     /// call site instead of silently doing nothing.
-    SameAdmin = 33,
+    SameAdmin = 37,
     /// `init_admin` was called with a `rotation_timelock_seconds` below
     /// `MIN_SCHEDULE_INTERVAL` — too short to serve its purpose of giving the
     /// legitimate admin a window to notice and react to a rotation proposal.
-    RotationTimelockTooShort = 34,
+    RotationTimelockTooShort = 38,
     /// State transition is not allowed.
-    InvalidStateTransition = 35,
+    InvalidStateTransition = 39,
     /// Invariant violation detected - bill data is inconsistent.
-    InvariantViolation = 36,
+    InvariantViolation = 40,
 }
 
 pub type Error = BillPaymentsError;
@@ -2948,12 +2896,18 @@ impl BillPayments {
     /// Get a page of archived bills for `owner`.
     ///
     /// Returned order is canonical bill ID ascending across pages.
+    ///
+    /// # Security
+    /// Requires `owner.require_auth()`. The archived-bill index is per-owner, so
+    /// results are scoped to `owner` and no cross-owner leakage can occur via
+    /// cursor manipulation.
     pub fn get_archived_bills(
         env: Env,
         owner: Address,
         cursor: u32,
         limit: u32,
     ) -> ArchivedBillPage {
+        owner.require_auth();
         let limit = clamp_limit(limit);
         let archived: Map<u32, ArchivedBill> = env
             .storage()
@@ -3027,12 +2981,18 @@ impl BillPayments {
     /// # Gas Complexity
     /// O(clamp_limit(limit)) `ARCH_BILL` map lookups regardless of total archive size, because
     /// only the owner's index entry is read rather than scanning the full `ARCH_BILL` map.
+    ///
+    /// # Security
+    /// Requires `owner.require_auth()`. The archived-bill index is per-owner, so
+    /// results are scoped to `owner` and no cross-owner leakage can occur via
+    /// cursor manipulation.
     pub fn get_archived_bills_page(
         env: Env,
         owner: Address,
         cursor: u32,
         limit: u32,
     ) -> ArchivedBillPage {
+        owner.require_auth();
         let effective_limit = clamp_limit(limit);
         let archived: Map<u32, ArchivedBill> = env
             .storage()
@@ -3674,6 +3634,11 @@ impl BillPayments {
     ///
     /// The currency string is normalized for consistent lookup.
     /// Pagination uses the existing currency index for O(currency_bills) traversal.
+    ///
+    /// # Security
+    /// Requires `owner.require_auth()`. The per-`(owner, currency)` index is
+    /// scoped to `owner`, so no cross-owner leakage can occur via cursor
+    /// manipulation.
     pub fn get_unpaid_bills_by_currency(
         env: Env,
         owner: Address,
@@ -3681,6 +3646,7 @@ impl BillPayments {
         cursor: u32,
         limit: u32,
     ) -> BillPage {
+        owner.require_auth();
         let limit = clamp_limit(limit);
         let normalized_currency = Self::normalize_currency(&env, &currency);
         let bills: Map<u32, Bill> = env
@@ -3749,6 +3715,11 @@ impl BillPayments {
     /// # Canonical Ordering
     /// Results are always ordered by bill ID ascending. Pagination uses the same
     /// ordering, so `cursor` is stable across repeated calls.
+    ///
+    /// # Security
+    /// Requires `owner.require_auth()`. The per-`(owner, currency)` index is
+    /// scoped to `owner`, so no cross-owner leakage can occur via cursor
+    /// manipulation.
     pub fn get_bills_by_currency(
         env: Env,
         owner: Address,
@@ -3756,6 +3727,7 @@ impl BillPayments {
         cursor: u32,
         limit: u32,
     ) -> BillPage {
+        owner.require_auth();
         let limit = clamp_limit(limit);
         let normalized_currency = Self::normalize_currency(&env, &currency);
         let bills: Map<u32, Bill> = env
