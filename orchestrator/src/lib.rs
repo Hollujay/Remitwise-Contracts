@@ -773,15 +773,9 @@ impl Orchestrator {
             return Err(OrchestratorError::InvalidAmount);
         }
 
-        let savings_amt = allocations
-            .get(1)
-            .ok_or(OrchestratorError::InvalidAmount)?;
-        let bills_amt = allocations
-            .get(2)
-            .ok_or(OrchestratorError::InvalidAmount)?;
-        let insurance_amt = allocations
-            .get(3)
-            .ok_or(OrchestratorError::InvalidAmount)?;
+        let savings_amt = allocations.get(1).ok_or(OrchestratorError::InvalidAmount)?;
+        let bills_amt = allocations.get(2).ok_or(OrchestratorError::InvalidAmount)?;
+        let insurance_amt = allocations.get(3).ok_or(OrchestratorError::InvalidAmount)?;
 
         if savings_amt < 0 || bills_amt < 0 || insurance_amt < 0 {
             return Err(OrchestratorError::InvalidAmount);
@@ -1638,10 +1632,8 @@ impl Orchestrator {
     /// interface). Both were previously indistinguishable from the caller's
     /// perspective.
     fn emit_cross_contract_failure(env: &Env, step: Symbol, rejected_by_contract: bool) {
-        env.events().publish(
-            (symbol_short!("cctx_err"), step),
-            rejected_by_contract,
-        );
+        env.events()
+            .publish((symbol_short!("cctx_err"), step), rejected_by_contract);
     }
 
     /// Compensate a savings-goal contribution if it was applied.

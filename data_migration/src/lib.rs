@@ -1144,7 +1144,6 @@ pub fn import_from_binary_untracked(bytes: &[u8]) -> Result<ExportSnapshot, Migr
     import_from_binary(bytes, &mut tracker, 0)
 }
 
-
 /// Version compatibility check for migration scripts.
 pub fn check_version_compatibility(version: u32) -> Result<(), MigrationError> {
     if (MIN_SUPPORTED_VERSION..=SCHEMA_VERSION).contains(&version) {

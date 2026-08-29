@@ -1792,7 +1792,24 @@ impl BillPayments {
             .get(&symbol_short!("NEXT_ID"))
             .unwrap_or(0u32);
 
-        for schedule_id in 1..=next_schedule_id {
+        let start_schedule_id = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("EXE_CURS"))
+            .unwrap_or(1u32);
+
+        let mut schedules_checked = 0;
+        let mut next_cursor = start_schedule_id;
+
+        for schedule_id in start_schedule_id..=next_schedule_id {
+            next_cursor = schedule_id + 1;
+            schedules_checked += 1;
+
+            if schedules_checked > MAX_BATCH_SIZE as u32 {
+                next_cursor = schedule_id; // Will resume from this ID on the next call
+                break;
+            }
+
             let Some(mut schedule) = schedules.get(schedule_id) else {
                 continue;
             };
@@ -1868,6 +1885,12 @@ impl BillPayments {
                 (symbol_short!("bill"), BillEvent::ScheduleExecuted),
                 schedule_id,
             );
+        }
+
+        if next_cursor > next_schedule_id {
+            env.storage().instance().remove(&symbol_short!("EXE_CURS"));
+        } else {
+            env.storage().instance().set(&symbol_short!("EXE_CURS"), &next_cursor);
         }
 
         env.storage().instance().set(&STORAGE_BSCHEDS, &schedules);

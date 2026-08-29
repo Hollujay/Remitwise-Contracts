@@ -2648,12 +2648,12 @@ impl RemitwiseEvents {
 ///
 /// # Arguments
 /// * `env`   – Soroban environment.
-    /// * `op`    – A short [`Symbol`] identifying the operation being audited
-    ///   (e.g. `symbol_short!("flow_exec")`).  Must be ≤ 9 bytes
-    ///   ([`SHORT_SYMBOL_MAX_LEN`]).
+/// * `op`    – A short [`Symbol`] identifying the operation being audited
+///   (e.g. `symbol_short!("flow_exec")`).  Must be ≤ 9 bytes
+///   ([`SHORT_SYMBOL_MAX_LEN`]).
 /// * `actor` – The [`Address`] of the principal that triggered the operation.
-    /// * `meta`  – An arbitrary `IntoVal` payload carrying operation-specific
-    ///   context (amount, result, IDs, etc.).  Keep it compact.
+/// * `meta`  – An arbitrary `IntoVal` payload carrying operation-specific
+///   context (amount, result, IDs, etc.).  Keep it compact.
 ///
 /// # Panics (test-only)
 /// In `#[cfg(test)]` builds the call panics if the serialized `meta` payload
@@ -4213,7 +4213,7 @@ mod upgrade_epoch_guard_tests {
         let env_b = Env::default();
 
         bump_upgrade_epoch(&env_a); // env_a = 1
-        // env_b still has epoch 0
+                                    // env_b still has epoch 0
         assert_eq!(require_matching_upgrade_epoch(&env_a, 1), Ok(()));
         assert_eq!(require_matching_upgrade_epoch(&env_b, 0), Ok(()));
         assert_eq!(
