@@ -121,7 +121,13 @@ pub struct EmergencyStateSnapshot {
     pub signer_epoch: u64,
     pub signer_threshold: Option<u32>,
     pub activation_epoch: Option<u64>,
-    pub active_scope: Option<PauseScope>,
+    /// 0 or 1 elements. `Option<PauseScope>` is not used here because the
+    /// `#[contracttype]` derive cannot generate an `ScVal` conversion for
+    /// `Option<T>` when `T` is a locally-defined multi-variant enum with
+    /// mixed unit/tuple variants (like `PauseScope`) — `Vec<T>` (0-or-1
+    /// elements) uses the same per-element conversion `PauseScope` already
+    /// has elsewhere in this file and does not hit that limitation.
+    pub active_scope: Vec<PauseScope>,
     pub recovery_ready_at: Option<u64>,
     pub scope_was_paused: Option<bool>,
 }
@@ -1043,7 +1049,12 @@ impl EmergencyKillswitch {
                 .unwrap_or(0),
             signer_threshold: env.storage().instance().get(&DataKey::SignerThreshold),
             activation_epoch: env.storage().instance().get(&DataKey::ActivationEpoch),
-            active_scope: env.storage().instance().get(&DataKey::ActiveScope),
+            active_scope: env
+                .storage()
+                .instance()
+                .get::<_, PauseScope>(&DataKey::ActiveScope)
+                .map(|s| Vec::from_array(&env, [s]))
+                .unwrap_or_else(|| Vec::new(&env)),
             recovery_ready_at: env.storage().instance().get(&DataKey::RecoveryReadyAt),
             scope_was_paused: env.storage().instance().get(&DataKey::ScopeWasPaused),
         };
@@ -1138,8 +1149,8 @@ impl EmergencyKillswitch {
         } else {
             env.storage().instance().remove(&DataKey::ActivationEpoch);
         }
-        if let Some(v) = &snapshot.active_scope {
-            env.storage().instance().set(&DataKey::ActiveScope, v);
+        if let Some(v) = snapshot.active_scope.get(0) {
+            env.storage().instance().set(&DataKey::ActiveScope, &v);
         } else {
             env.storage().instance().remove(&DataKey::ActiveScope);
         }
@@ -1873,6 +1884,7 @@ mod storage_migration_tests {
     #[test]
     fn migration_progress_reflects_completed_state() {
         let (env, client, admin) = setup();
+        env.ledger().with_mut(|li| li.timestamp = 1_700_000_000);
         client.migrate_storage(&admin);
         let progress = client.get_migration_progress();
         assert!(progress.is_some());
@@ -2037,8 +2049,7 @@ mod storage_migration_tests {
         client.pre_upgrade(&admin);
 
         // Fast-forward past the snapshot TTL.
-        env.ledger()
-            .with_mut(|li| li.timestamp = env.ledger().timestamp() + SNAPSHOT_TTL + 1);
+        env.ledger().with_mut(|li| li.timestamp += SNAPSHOT_TTL + 1);
 
         let res = client.try_restore_from_snapshot(&admin);
         assert_eq!(res, Err(Ok(Error::SnapshotExpired)));
@@ -2054,7 +2065,7 @@ mod storage_migration_tests {
         let second = Address::generate(&env);
 
         let signers = vec![&env, first.clone(), second.clone()];
-        client.configure_signers(&admin, &signers, 2);
+        client.configure_signers(&admin, &signers, &2);
         assert_eq!(client.get_signer_epoch(), 1);
         assert_eq!(client.get_signer_threshold(), 2);
 
@@ -2152,7 +2163,7 @@ mod storage_migration_tests {
         // Step 1: establish state.
         client.pause();
         let signers = vec![&env, first.clone(), second.clone()];
-        client.configure_signers(&admin, &signers, 2);
+        client.configure_signers(&admin, &signers, &2);
         client.bump_kill_switch_epoch(&admin);
 
         // Step 2: snapshot.
@@ -2163,7 +2174,7 @@ mod storage_migration_tests {
         env.ledger().with_mut(|li| li.timestamp += 200);
         client.unpause();
         let new_signers = vec![&env, second, third];
-        client.configure_signers(&admin, &new_signers, 1);
+        client.configure_signers(&admin, &new_signers, &1);
         client.bump_kill_switch_epoch(&admin);
 
         assert!(!client.is_paused());
@@ -2335,7 +2346,7 @@ mod snapshot_function_pause_restore_tests {
         let first = Address::generate(&env);
         let second = Address::generate(&env);
         let signers = vec![&env, first.clone(), second.clone()];
-        let epoch = client.configure_signers(&admin, &signers, 2);
+        let epoch = client.configure_signers(&admin, &signers, &2);
         let approvals = vec![&env, first, second];
         let mod_sym = symbol_short!("bill");
         client.activate(&epoch, &approvals, &PauseScope::Module(mod_sym.clone()));
