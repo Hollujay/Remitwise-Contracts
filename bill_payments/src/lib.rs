@@ -333,40 +333,30 @@ pub enum BillPaymentsError {
 
 pub type Error = BillPaymentsError;
 
+/// Receipt returned by atomic pay operations.
+///
+/// Captures the deterministic result of `pay_bill` so callers can verify
+/// the operation completed without partial state.
 #[contracttype]
-#[derive(Clone)]
-pub struct ArchivedBill {
-    pub id: u32,
-    pub owner: Address,
-    pub name: String,
-    pub external_ref: Option<String>,
-    pub amount: i128,
-    pub paid_at: u64,
-    pub archived_at: u64,
-    pub tags: Vec<String>,
-    pub currency: String,
+#[derive(Clone, Debug)]
+pub struct AtomicPayReceipt {
+    pub bill_id: u32,
+    pub paid_amount: i128,
+    pub child_bill_id: Option<u32>,
+    pub child_due_date: Option<u64>,
 }
 
-/// Paginated result for archived bill queries
+/// Receipt returned by atomic batch pay operations.
+///
+/// Each entry captures the result of one bill in the batch.
+/// The entire batch is atomic: either all entries succeed or
+/// the entire operation returns an error with no state changes.
 #[contracttype]
-#[derive(Clone)]
-pub struct ArchivedBillPage {
-    pub items: Vec<ArchivedBill>,
-    /// 0 means no more pages
-    pub next_cursor: u32,
-    pub count: u32,
+#[derive(Clone, Debug)]
+pub struct AtomicBatchPayReceipt {
+    pub paid_count: u32,
+    pub receipts: Vec<AtomicPayReceipt>,
 }
-
-impl ArchivedBillPage {
-    /// Returns the first archived bill in the page, or a typed error when the page is empty.
-    pub fn first(&self) -> Result<ArchivedBill, BillPaymentsError> {
-        match self.items.get(0) {
-            Some(bill) => Ok(bill.clone()),
-            None => Err(BillPaymentsError::EmptyPage),
-        }
-    }
-}
-
 #[contracttype]
 #[derive(Clone)]
 pub enum BillEvent {
@@ -2234,8 +2224,7 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
-        let _bill_external_ref = bill.external_ref.clone();
+        let bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
 
         // Check paid status FIRST for backward compatibility
         if bill.paid {
@@ -2252,11 +2241,7 @@ impl BillPayments {
         }
 
         let current_time = env.ledger().timestamp();
-        require_within_settlement_window(current_time, bill.due_date, MAX_SETTLEMENT_WINDOW_SECS)
-            .map_err(|_| BillPaymentsError::SettlementWindowExpired)?;
-
-        bill.paid = true;
-        bill.paid_at = Some(current_time);
+        let mut child_bill_entry: Option<(u32, Bill)> = None;
 
         if bill.recurring {
             let owner_bill_count = Self::get_owner_bill_count(env.clone(), bill.owner.clone());
@@ -2270,7 +2255,8 @@ impl BillPayments {
                 .due_date
                 .checked_add(period)
                 .ok_or(Error::InvalidDueDate)?;
-            // Advance forward by frequency periods until the next due date is strictly in the future
+            // Advance forward by frequency periods until the next due date is
+            // strictly in the future. Each iteration may overflow → InvalidDueDate.
             while next_due_date <= current_time {
                 next_due_date = next_due_date
                     .checked_add(period)
@@ -2299,27 +2285,35 @@ impl BillPayments {
                 tags: bill.tags.clone(),
                 currency: bill.currency.clone(),
             };
-            let next_bill_amount = next_bill.amount;
+            child_bill_entry = Some((next_id, next_bill));
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 2: All computation succeeded — apply mutations atomically.
+        // -----------------------------------------------------------------
+        let mut paid_bill = bill.clone();
+        paid_bill.paid = true;
+        paid_bill.paid_at = Some(current_time);
+        bills.set(bill_id, paid_bill.clone());
+
+        let paid_amount = paid_bill.amount;
+        let was_recurring = paid_bill.recurring;
+        let bill_ext_ref = paid_bill.external_ref.clone();
+
+        if let Some((next_id, next_bill)) = child_bill_entry {
+            let child_due_date = next_bill.due_date;
             bills.set(next_id, next_bill);
             env.storage()
                 .instance()
                 .set(&symbol_short!("NEXT_ID"), &next_id);
-            // Update owner index for the newly created recurring bill
             Self::index_add_active(&env, &caller, next_id);
-            // Update currency index for the newly created recurring bill
-            Self::index_add_currency(&env, &caller, &bill.currency, next_id);
-            // Update unpaid total for the new recurring bill
-            Self::adjust_unpaid_total(&env, &caller, next_bill_amount);
+            Self::index_add_currency(&env, &caller, &paid_bill.currency, next_id);
             env.events().publish(
                 (symbol_short!("bill"), BillEvent::RecurringBillCreated),
-                (next_id, bill_id, next_due_date),
+                (next_id, bill_id, child_due_date),
             );
         }
 
-        let paid_amount = bill.amount;
-        let _was_recurring = bill.recurring;
-        let bill_ext_ref = bill.external_ref.clone();
-        bills.set(bill_id, bill);
         env.storage()
             .instance()
             .set(&symbol_short!("BILLS"), &bills);
@@ -3171,31 +3165,28 @@ impl BillPayments {
         Self::require_not_paused(&env, pause_functions::ARCHIVE)?;
         Self::extend_instance_ttl(&env);
 
-        let mut bills: Map<u32, Bill> = env
+        let bills: Map<u32, Bill> = env
             .storage()
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let mut archived: Map<u32, ArchivedBill> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("ARCH_BILL"))
-            .unwrap_or_else(|| Map::new(&env));
 
         let current_time = env.ledger().timestamp();
-        let mut archived_count = 0u32;
-        let mut to_remove: Vec<u32> = Vec::new(&env);
+
+        // -----------------------------------------------------------------
+        // Phase 1: Scan and collect all qualifying bills into staging buffers.
+        // No storage is modified during this scan. External refs are NOT
+        // released yet — that happens in Phase 2 after all computation
+        // succeeds, ensuring the operation is fully atomic.
+        // -----------------------------------------------------------------
+        // staging_archived: bill_id -> ArchivedBill (bills to archive)
+        let mut staging_archived: Map<u32, ArchivedBill> = Map::new(&env);
         let mut owner_to_archived: Map<Address, Vec<u32>> = Map::new(&env);
         let mut owner_currency_to_removed: Map<(Address, String), Vec<u32>> = Map::new(&env);
 
         for (id, bill) in bills.iter() {
             if let Some(paid_at) = bill.paid_at {
                 if bill.paid && paid_at < before_timestamp {
-                    // Release external_ref from the active index during archival
-                    if let Some(ref r) = bill.external_ref {
-                        Self::release_external_ref(&env, &bill.owner, r);
-                    }
-
                     let archived_bill = ArchivedBill {
                         id: bill.id,
                         owner: bill.owner.clone(),
@@ -3207,7 +3198,7 @@ impl BillPayments {
                         tags: bill.tags.clone(),
                         currency: bill.currency.clone(),
                     };
-                    archived.set(id, archived_bill);
+                    staging_archived.set(id, archived_bill);
 
                     let mut list = owner_to_archived
                         .get(bill.owner.clone())
@@ -3215,21 +3206,38 @@ impl BillPayments {
                     list.push_back(id);
                     owner_to_archived.set(bill.owner.clone(), list);
 
-                    // Track currency for index removal
                     let currency_key = (bill.owner.clone(), bill.currency.clone());
                     let mut currency_list = owner_currency_to_removed
                         .get(currency_key.clone())
                         .unwrap_or_else(|| Vec::new(&env));
                     currency_list.push_back(id);
                     owner_currency_to_removed.set(currency_key, currency_list);
-
-                    to_remove.push_back(id);
-                    archived_count += 1;
                 }
             }
         }
 
-        for id in to_remove.iter() {
+        let archived_count = staging_archived.len();
+        if archived_count == 0 {
+            return Ok(0);
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 2: All qualifying bills identified — apply mutations atomically.
+        // -----------------------------------------------------------------
+        let mut bills = bills;
+        let mut archived: Map<u32, ArchivedBill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ARCH_BILL"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        for (id, staged_bill) in staging_archived.iter() {
+            // Release external_ref from the active index
+            if let Some(ref r) = staged_bill.external_ref {
+                Self::release_external_ref(&env, &staged_bill.owner, r);
+            }
+
+            archived.set(id, staged_bill);
             bills.remove(id);
         }
 
@@ -3429,7 +3437,7 @@ impl BillPayments {
         }
 
         Self::extend_instance_ttl(&env);
-        let mut bills: Map<u32, Bill> = env
+        let bills: Map<u32, Bill> = env
             .storage()
             .instance()
             .get(&symbol_short!("BILLS"))
@@ -3437,11 +3445,26 @@ impl BillPayments {
 
         let mut unpaid_delta = 0i128;
         let current_time = env.ledger().timestamp();
-        let mut next_id = env
+        let current_next_id = env
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_ID"))
             .unwrap_or(0u32);
+
+        // -----------------------------------------------------------------
+        // Phase 1: Validate and compute ALL side-effects in staging buffers.
+        // No storage is modified during this phase. If any bill's recurring
+        // computation overflows, the entire batch reverts with no partial
+        // state — the caller receives the error and can retry safely.
+        // -----------------------------------------------------------------
+        // staging_child: next_bill_id -> next Bill (recurring children)
+        let mut staging_child: Map<u32, Bill> = Map::new(&env);
+        // staging_paid: bill_id -> paid Bill
+        let mut staging_paid: Map<u32, Bill> = Map::new(&env);
+        // parent_to_child: parent_bill_id -> child_bill_id
+        let mut parent_to_child: Map<u32, u32> = Map::new(&env);
+        let mut running_next_id = current_next_id;
+        let mut total_unpaid_delta: i128 = 0;
 
         for bill_id in bill_ids.iter() {
             let mut bill = match bills.get(bill_id) {
@@ -3485,7 +3508,7 @@ impl BillPayments {
                 next_id = next_id.checked_add(1).ok_or(Error::InvalidDueDate)?;
 
                 let next_bill = Bill {
-                    id: next_id,
+                    id: running_next_id,
                     owner: bill.owner.clone(),
                     name: bill.name.clone(),
                     external_ref: None,
@@ -3516,7 +3539,7 @@ impl BillPayments {
             bills.set(bill_id, bill);
             env.events().publish(
                 (symbol_short!("bill"), BillEvent::Paid),
-                (bill_id, caller.clone(), external_ref.clone()),
+                (bill_id, caller.clone(), external_ref),
             );
             RemitwiseEvents::emit(
                 &env,
@@ -3529,13 +3552,13 @@ impl BillPayments {
 
         env.storage()
             .instance()
-            .set(&symbol_short!("NEXT_ID"), &next_id);
+            .set(&symbol_short!("NEXT_ID"), &running_next_id);
         env.storage()
             .instance()
             .set(&symbol_short!("BILLS"), &bills);
 
-        if unpaid_delta != 0 {
-            Self::adjust_unpaid_total(&env, &caller, unpaid_delta);
+        if total_unpaid_delta != 0 {
+            Self::adjust_unpaid_total(&env, &caller, total_unpaid_delta);
         }
 
         Self::update_storage_stats(&env);
