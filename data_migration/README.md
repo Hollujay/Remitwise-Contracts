@@ -173,6 +173,11 @@ the caller.
 
 **Why this matters:** migration is where contract invariants are most easily bypassed, because data arrives pre-formed rather than through guarded entry-points. A split config that sums to 73% or 140%, or a savings snapshot with a wound-back `next_id`, would produce corrupt on-chain state that the contract would subsequently refuse to touch — a silent data-integrity bug introduced at the import boundary.
 
+Reconciliation identity is also enforced at this boundary. Savings-goal
+snapshots with duplicate `(owner, id)` logical records are rejected because
+pagination and settlement reconciliation cannot prove that each record was
+processed exactly once when two records share the same stable key.
+
 ## Tracked vs Untracked duplicate protection
 
 [`MigrationTracker`] is how this crate prevents the same snapshot from being applied
